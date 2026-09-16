@@ -5,7 +5,7 @@
 
 # kinesis
 
-use your meta neural band to control your mac
+use your meta neural band to control your mac — or your linux desktop
 
 
 https://github.com/user-attachments/assets/25e974bc-a6ca-450f-83f0-732c6d40075c
@@ -18,7 +18,17 @@ built on some tinkering i did with astra in [neural-band-poc](https://github.com
 
 some things may act quirky or not work at all, if that is the case i would love to know why, but this is all highly experimental
 
-## run it
+## linux
+
+this fork adds a linux port in [`linux/`](linux/README.md): the same protocol and gesture rules on bun, with bluez for the bluetooth link and kde global shortcuts (or your own commands) for the actions.
+
+```sh
+cd linux && bun install
+bun run src/cli.ts scan
+bun run src/cli.ts run
+```
+
+## run it (macos)
 **be sure to unpair your band from the meta app before you get started**
 
 [download kinesis](https://github.com/callbacked/kinesis/releases/latest), open the dmg, and drag it into applications. needs macos 14+ and a neural band. works on apple silicon and intel.

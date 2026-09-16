@@ -1,0 +1,331 @@
+// The observed band handshake and input subscription. It never exports session keys.
+// Port of Sources/KinesisCore/BandSession.swift. Transport-agnostic: feed() takes
+// bytes from the L2CAP link and returns bytes to write back plus decoded events.
+
+import { createECDH, randomBytes } from "node:crypto";
+import { AirShieldCipher, AirShieldKeys, AirShieldReceiver } from "./airshield";
+import { PinchDial } from "./dial";
+import type { BandEvent, BandGesture, BandHand } from "./gestures";
+import { BandProtocolError, BandWire, DataXReceiver, type DataXFrame, ProtoFields, be16, be32, concat } from "./wire";
+
+interface HandRequest {
+  id: bigint;
+  hand: BandHand | undefined;
+  reading: boolean;
+  deadline: number;
+}
+
+const FINGERS = ["unknown", "thumb", "index", "middle", "notApplicable"];
+const ACTIONS = ["unknown", "press", "release", "tap", "doubletap", "click", "up", "down", "left", "right", "wake",
+  "swipeIn", "swipeOut", "ia", "partialPress", "partialRelease", "partialClick", "partialUp", "partialDown",
+  "partialLeft", "partialRight"];
+const DERIVED = ["unknown", "singleTap", "doubleTap", "buttonHold", "buttonRelease", "buttonUp", "buttonDown",
+  "buttonLeft", "buttonRight", "buttonPress", "buttonHoldRelease"];
+
+const event = (payload: BandEvent["payload"], receivedAt: number): BandEvent => ({ payload, receivedAt });
+
+export class BandSession {
+  private readonly ecdh = createECDH("prime256v1");
+  private readonly challenge = new Uint8Array(randomBytes(16));
+  private readonly seed = new Uint8Array(randomBytes(32));
+  private readonly iv = new Uint8Array(randomBytes(16));
+  private readonly base = randomBytes(4).readUInt32LE(0);
+  private peerKey: Uint8Array | undefined;
+  private peerChallenge: Uint8Array | undefined;
+  private pending: Uint8Array = new Uint8Array();
+  private transmitter: AirShieldCipher | undefined;
+  private receiver: AirShieldReceiver | undefined;
+  private datax = new DataXReceiver();
+  private channelTypes = new Map<number, number>();
+  private dial = new PinchDial();
+  private emittedEngagement = false;
+  private dialPending = 0;
+  private lastDial = -Infinity;
+  private lastHeartbeat = -Infinity;
+  private streaming = false;
+  private stopping = false;
+  stopAcknowledged = false;
+  authenticatedPackets = 0;
+  motionMessages = 0;
+  streamsEnabled = false;
+  // Keep these together: enable, disable, and acknowledgement must agree.
+  private readonly streamFields = [3, 6, 8];
+  private readonly streamChannel = 0x8005;
+  private readonly configurationChannel = 0x8006;
+  private configurationID = 0n;
+  private handRequest: HandRequest | undefined;
+  hand: BandHand | undefined;
+
+  constructor() {
+    this.ecdh.generateKeys();
+  }
+
+  private get publicKey(): Uint8Array {
+    return new Uint8Array(this.ecdh.getPublicKey()).subarray(1);
+  }
+
+  request(): Uint8Array {
+    return BandWire.frame(0x8001, [0x81000005, 0x02000001], concat(
+      BandWire.field(1, this.publicKey), BandWire.field(2, this.challenge), BandWire.field(3, 0),
+      BandWire.field(4, 31), BandWire.field(7, 16)));
+  }
+
+  feed(bytes: Uint8Array, time: number): { outgoing: Uint8Array; events: BandEvent[] } {
+    this.pending = concat(this.pending, bytes);
+    const outgoing: Uint8Array[] = [];
+    let events: BandEvent[] = [];
+    while (this.receiver === undefined && this.pending.length >= 4) {
+      if (!(this.pending[0]! & 0x80)) throw new BandProtocolError("Unexpected bytes before band encryption");
+      const size = (be16(this.pending, 0) & 0x7fff) + 4;
+      if (size < 8) throw new BandProtocolError("Invalid band setup length");
+      if (this.pending.length < size) break;
+      const frame = this.pending.slice(0, size);
+      this.pending = this.pending.slice(size);
+      const offset = frame[2]! & 0x80 ? 8 : 4;
+      if (size < offset + 4) throw new BandProtocolError("Truncated band setup header");
+      const kind = be32(frame, offset);
+      const fields = new ProtoFields(frame.subarray(offset + 4));
+      const point = fields.bytes(1, 64);
+      switch (kind) {
+        case 0x02000001: {
+          if (this.peerKey !== undefined || fields.integer(3) !== 0n || fields.integer(4) !== 3n) {
+            throw new BandProtocolError("Unsupported band encryption parameters");
+          }
+          this.peerKey = point;
+          this.peerChallenge = fields.bytes(2, 16);
+          outgoing.push(BandWire.frame(1, [0x02000002], concat(
+            BandWire.field(1, this.publicKey), BandWire.field(2, this.seed), BandWire.field(3, this.iv),
+            BandWire.field(4, this.base), BandWire.field(5, 3))));
+          break;
+        }
+        case 0x02000002: {
+          const peerChallenge = this.peerChallenge;
+          if (!this.peerKey || !peerChallenge || Buffer.compare(point, this.peerKey) !== 0 || fields.integer(5) !== 3n) {
+            throw new BandProtocolError("Unexpected band encryption response");
+          }
+          const secret = new Uint8Array(this.ecdh.computeSecret(concat(new Uint8Array([4]), point)));
+          const peerSeed = fields.bytes(2, 32);
+          const peerIV = fields.bytes(3, 16);
+          const peerBase = fields.integer(4);
+          if (peerBase < 0n || peerBase > 0xffffffffn) throw new BandProtocolError("Invalid band packet counter");
+          this.transmitter = new AirShieldCipher(AirShieldKeys.derive(secret, peerChallenge, this.seed), this.iv, this.base);
+          this.receiver = new AirShieldReceiver(new AirShieldCipher(
+            AirShieldKeys.derive(secret, this.challenge, peerSeed), peerIV, Number(peerBase)));
+          // Empty identity query and EndLinkSetup are required by the observed firmware.
+          outgoing.push(this.encrypt(BandWire.frame(0x8002, [0x81000024, 0x02003000])));
+          outgoing.push(this.encrypt(BandWire.frame(0x8001, [0x02001000], concat(
+            BandWire.field(1, 1), BandWire.field(2, new Uint8Array(randomBytes(16)))))));
+          outgoing.push(this.encrypt(BandWire.frame(0x8003, [0x8100ce56, 0x02000314], concat(
+            BandWire.field(1, 1), BandWire.field(3, new Uint8Array())))));
+          outgoing.push(this.streamRequest(2n, undefined));
+          outgoing.push(this.streamRequest(3n, true));
+          outgoing.push(this.requestHand(undefined, true, time));
+          break;
+        }
+        default:
+          throw new BandProtocolError("Unrecognized band setup message");
+      }
+    }
+    if (this.receiver !== undefined) {
+      const records = this.receiver.feed(this.pending);
+      this.pending = new Uint8Array();
+      for (const plaintext of records) {
+        this.authenticatedPackets += 1;
+        for (const frame of this.datax.feed(plaintext)) {
+          events = events.concat(this.input(frame, time, outgoing));
+        }
+        if (this.streaming && !this.stopping && time - this.lastHeartbeat >= 0.2) {
+          this.lastHeartbeat = time;
+          events.push(event({ type: "heartbeat" }, time));
+        }
+      }
+    }
+    return { outgoing: concat(...outgoing), events };
+  }
+
+  tick(time: number): BandEvent[] {
+    this.dial.tick(time);
+    const events = this.engagementEvents(time);
+    if (this.handRequest && time >= this.handRequest.deadline && !this.stopping) {
+      this.handRequest = undefined;
+      this.hand = undefined;
+      events.push(event({ type: "handednessFailure", message: "Couldn't confirm the band hand. Reconnect and try again." }, time));
+    }
+    return events;
+  }
+
+  setHandedness(hand: BandHand, time: number): Uint8Array {
+    if (!this.streamsEnabled || this.stopping || this.hand === undefined || this.handRequest !== undefined) {
+      throw new BandProtocolError("Wait for the band to report its hand before changing it.");
+    }
+    this.dial = new PinchDial();
+    return this.requestHand(hand, false, time);
+  }
+
+  private requestHand(hand: BandHand | undefined, reading: boolean, time: number): Uint8Array {
+    const id = this.configurationID + 1n;
+    // ConfigReq.is_left_handed is field 10. An empty ConfigReq reads current settings.
+    const config = reading ? new Uint8Array() : BandWire.field(10, hand === "left" ? 1 : 0);
+    const bytes = this.encrypt(BandWire.frame(this.configurationChannel,
+      this.configurationID === 0n ? [0x8100ce56, 0x02000314] : [],
+      concat(BandWire.field(1, id), BandWire.field(5, config))));
+    this.configurationID = id;
+    this.handRequest = { id, hand, reading, deadline: time + 5 };
+    return bytes;
+  }
+
+  private receiveHand(fields: ProtoFields, time: number, outgoing: Uint8Array[]): BandEvent[] {
+    const request = this.handRequest;
+    if (!request || fields.integer(1) !== request.id) return [];
+    this.handRequest = undefined;
+    if (time >= request.deadline) {
+      this.hand = undefined;
+      return [event({ type: "handednessFailure", message: "Couldn't confirm the band hand. Reconnect and try again." }, time)];
+    }
+    if (fields.integer(2) !== 1n) {
+      this.hand = undefined;
+      return [event({ type: "handednessFailure", message: "The band couldn't apply its hand setting. Reconnect and try again." }, time)];
+    }
+    if (!request.reading) {
+      // Read it again independently; a successful write status alone isn't confirmation.
+      outgoing.push(this.requestHand(request.hand, true, time));
+      return [];
+    }
+    if (!fields.contains(6)) {
+      this.hand = undefined;
+      return [event({ type: "handednessFailure", message: "This band didn't report its hand setting." }, time)];
+    }
+    const config = new ProtoFields(fields.bytes(6));
+    if (!config.contains(10) || config.integer(10) > 1n) {
+      this.hand = undefined;
+      return [event({ type: "handednessFailure", message: "This band didn't report its hand setting." }, time)];
+    }
+    const reported: BandHand = config.integer(10) === 1n ? "left" : "right";
+    this.hand = reported;
+    const events = [event({ type: "handedness", hand: reported }, time)];
+    if (request.hand !== undefined && reported !== request.hand) {
+      events.push(event({ type: "handednessFailure", message: "The band didn't keep the selected hand. Reconnect and try again." }, time));
+    }
+    return events;
+  }
+
+  /// Read the existing subscription's status when sensor traffic goes quiet.
+  queryStreamState(): Uint8Array {
+    if (!this.streamsEnabled || this.stopping) return new Uint8Array();
+    return this.streamRequest(5n, undefined);
+  }
+
+  stop(): Uint8Array {
+    if (this.stopping) return new Uint8Array();
+    this.stopping = true;
+    this.handRequest = undefined;
+    if (!this.transmitter) return new Uint8Array();
+    return this.streamRequest(4n, false);
+  }
+
+  private encrypt(data: Uint8Array): Uint8Array {
+    if (!this.transmitter) throw new BandProtocolError("Band encryption is not ready");
+    return this.transmitter.encrypt(data);
+  }
+
+  private streamRequest(id: bigint, enabled: boolean | undefined): Uint8Array {
+    const control = enabled === undefined
+      ? new Uint8Array()
+      : concat(...this.streamFields.map((field) => BandWire.field(field, enabled ? 1 : 0)));
+    return this.encrypt(BandWire.frame(this.streamChannel, id === 2n ? [0x8100ce56, 0x02000314] : [],
+      concat(BandWire.field(1, id), BandWire.field(4, control))));
+  }
+
+  private engagementEvents(time: number): BandEvent[] {
+    if (this.dial.engaged === this.emittedEngagement) return [];
+    this.emittedEngagement = this.dial.engaged;
+    this.dialPending = 0;
+    this.lastDial = -Infinity;
+    return [event({ type: "dialState", engaged: this.dial.engaged }, time)];
+  }
+
+  private input(frame: DataXFrame, time: number, outgoing: Uint8Array[]): BandEvent[] {
+    const last = frame.words[frame.words.length - 1];
+    if (last !== undefined) {
+      if (this.channelTypes.size >= 1024 && !this.channelTypes.has(frame.channel)) {
+        throw new BandProtocolError("Too many band input channels");
+      }
+      this.channelTypes.set(frame.channel, last);
+    }
+    const kind = this.channelTypes.get(frame.channel);
+    if (kind === undefined) return [];
+    // Ignore unrelated services without trying to interpret their protobuf schema.
+    if (![0x02000315, 0x0200020d, 0x0200020f, 0x02000212].includes(kind)) return [];
+    if (kind === 0x02000315 && (frame.channel & 0x7fff) === (this.configurationChannel & 0x7fff)) {
+      if (this.stopping) return [];
+      return this.receiveHand(new ProtoFields(frame.payload), time, outgoing);
+    }
+    if (kind === 0x02000315 && (frame.channel & 0x7fff) !== (this.streamChannel & 0x7fff)) return [];
+    const fields = new ProtoFields(frame.payload);
+    if (kind === 0x02000315) {
+      const request = fields.integer(1);
+      if (request === 3n || request === 5n) {
+        if (fields.integer(2) !== 1n) throw new BandProtocolError("The band rejected the input subscription");
+        const flags = new ProtoFields(fields.bytes(5));
+        this.streamsEnabled = this.streamFields.every((f) => flags.contains(f) && flags.integer(f) === 1n);
+        if (!this.streamsEnabled) throw new BandProtocolError("The band input subscription stopped");
+        if (!this.streaming && !this.stopping) {
+          this.streaming = true;
+          return [event({ type: "connected" }, time)];
+        }
+      } else if (request === 4n && fields.integer(2) === 1n && fields.contains(5)) {
+        const flags = new ProtoFields(fields.bytes(5));
+        this.stopAcknowledged = this.streamFields.every((f) => flags.contains(f) && flags.integer(f) === 0n);
+      }
+      return [];
+    }
+    if (this.stopping) return [];
+    const sequence = fields.requiredInteger(1);
+    const timestamp = fields.requiredInteger(2);
+    const events: BandEvent[] = [];
+    if (kind === 0x0200020d) {
+      const name = (field: number, names: string[]): string => {
+        const value = fields.integer(field);
+        return value < BigInt(names.length) ? names[Number(value)]! : `unrecognized:${value}`;
+      };
+      const gesture: BandGesture = {
+        sequence, timestampUs: timestamp,
+        finger: name(3, FINGERS), action: name(4, ACTIONS), derivedAction: name(5, DERIVED),
+        synthetic: fields.integer(12) !== 0n, receivedAt: time,
+      };
+      events.push(event({ type: "gesture", gesture }, time));
+      this.dial.gesture(gesture, time);
+      events.push(...this.engagementEvents(time));
+      return events;
+    }
+    const bytes = fields.bytes(3, kind === 0x0200020f ? 6 : 16);
+    this.motionMessages += 1;
+    if (!this.streaming) {
+      this.streaming = true;
+      events.push(event({ type: "connected" }, time));
+      events.push(event({ type: "heartbeat" }, time));
+      this.lastHeartbeat = time;
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (kind === 0x0200020f) {
+      const values: [number, number, number] = [view.getInt16(0, true), view.getInt16(2, true), view.getInt16(4, true)];
+      const delta = this.dial.gyro(timestamp, values, time);
+      events.push(...this.engagementEvents(time));
+      if (delta !== undefined) {
+        this.dialPending += delta;
+        if (time - this.lastDial >= 0.02) {
+          events.push(event({ type: "dialTurn", rotation: this.dialPending }, time));
+          this.lastDial = time;
+          this.dialPending = 0;
+        }
+      }
+    } else {
+      const values = [0, 1, 2, 3].map((i) => view.getFloat32(i * 4, true));
+      const norm = values.reduce((sum, v) => sum + v * v, 0);
+      if (!values.every(Number.isFinite) || norm < 0.9 || norm > 1.1) {
+        throw new BandProtocolError("Invalid band orientation sample");
+      }
+    }
+    return events;
+  }
+}

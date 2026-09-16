@@ -1,0 +1,17 @@
+{
+  "name": "kinesis-linux",
+  "version": "0.1.0",
+  "description": "Control Linux with a Meta Neural Band (BlueZ + L2CAP, KDE actions)",
+  "private": true,
+  "type": "module",
+  "bin": { "kinesis": "./src/cli.ts" },
+  "scripts": {
+    "start": "bun run src/cli.ts run",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.7.0"
+  }
+}
