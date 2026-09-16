@@ -96,7 +96,8 @@ the tested firmware accepts a fresh encrypted session without a bluetooth bond, 
 
 ## limits
 
-- verified against firmware `297b870dc9be+` through the mac and poc work; the linux transport was tested with a loopback peer and a real bluez scan, and needs a band in hand to confirm the l2cap open and handshake end to end. `run --verbose` shows each step.
+- **firmware gate**: verified end to end against a real band (`Meta Band XXXX`, hardware `Swiftlet-PS`): bluez connect, l2cap open, the airshield handshake, and packet decryption all work. that firmware then gates the input service behind a newer link-setup step (`0xc001`) that the mac app and the upstream poc also do not pass; see [docs/findings.md](docs/findings.md). older firmware should subscribe normally. `kinesis run --verbose` and `bun run scripts/probe.ts` show every setup frame.
+- `linkSetup` (`pipelined` default, or `phased`) and `configChannel` (`0x8006` or `0x8007`) are exposed for firmware that sequences link setup differently.
 - the l2cap receive mtu is requested at 8 kib; kernels that reject setting it before connect keep their default, which still carries the band's frames.
 - previous/next window use kwin's walk-through shortcuts, which switch immediately when invoked over d-bus.
 - brightness uses powerdevil, so external displays without ddc support won't respond.

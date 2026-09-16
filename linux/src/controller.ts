@@ -38,6 +38,8 @@ export interface ControllerHooks {
   onGesture?(gesture: RecognizedGesture): void;
   onDial?(delta: number): void;
   onHandConfirmed?(hand: BandHand): void;
+  /// BlueZ resolved the band's current identity (address may differ from the one saved at scan time).
+  onBandResolved?(device: BandDevice): void;
 }
 
 export class Controller {
@@ -62,6 +64,7 @@ export class Controller {
   private ticker: ReturnType<typeof setInterval> | undefined;
   private band: BandDevice | undefined;
   private enableWhenLive = false;
+  private readonly sessionOptions: { configChannel: number; phasedLinkSetup: boolean };
 
   constructor(
     private readonly config: Config,
@@ -73,6 +76,7 @@ export class Controller {
   ) {
     this.state.bandHand = config.hand ?? "right";
     this.started = clock();
+    this.sessionOptions = { configChannel: config.configChannel, phasedLinkSetup: config.linkSetup === "phased" };
   }
 
   /// Connect and keep reconnecting until disconnect() is called.
@@ -83,7 +87,7 @@ export class Controller {
     this.enableWhenLive = options.enableControls;
     this.retries = 0;
     this.ticker ??= setInterval(() => this.tick(), 500);
-    this.run({ kind: "connect", band, security: this.config.security });
+    this.run({ kind: "connect", band, security: this.config.security, session: this.sessionOptions });
   }
 
   async disconnect(): Promise<void> {
@@ -204,6 +208,7 @@ export class Controller {
     const payload = event.payload;
     switch (payload.type) {
       case "devices":
+        if (payload.devices.length === 1) this.hooks.onBandResolved?.(payload.devices[0]!);
         break;
       case "battery":
         this.state.battery = payload.percent;
@@ -322,7 +327,7 @@ export class Controller {
     this.retry = setTimeout(() => {
       this.retry = undefined;
       if (!this.wantsConnection || this.quitting || !this.band) return;
-      this.run({ kind: "connect", band: this.band, security: this.config.security });
+      this.run({ kind: "connect", band: this.band, security: this.config.security, session: this.sessionOptions });
     }, delay * 1000);
   }
 

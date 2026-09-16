@@ -9,6 +9,7 @@ export const SOCK_CLOEXEC = 0o2000000;
 export const BTPROTO_L2CAP = 0;
 export const SOL_BLUETOOTH = 274;
 export const BT_SECURITY = 4;
+export const BT_SNDMTU = 12;
 export const BT_RCVMTU = 13;
 export const BDADDR_LE_PUBLIC = 1;
 export const BDADDR_LE_RANDOM = 2;
@@ -28,7 +29,31 @@ export const libc = dlopen("libc.so.6", {
   shutdown: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
   strerror: { args: [FFIType.i32], returns: FFIType.cstring },
   __errno_location: { args: [], returns: FFIType.ptr },
+  fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  getsockopt: { args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 });
+
+const F_GETFL = 3, F_SETFL = 4, O_NONBLOCK = 0o4000, EINPROGRESS = 115, EINTR = 4;
+const SOL_SOCKET = 1, SO_ERROR = 4;
+export const POLLIN = 0x001, POLLOUT = 0x004, POLLERR = 0x008, POLLHUP = 0x010, POLLNVAL = 0x020;
+
+export class L2capCancelled extends Error {
+  constructor() {
+    super("L2CAP connect cancelled");
+    this.name = "L2capCancelled";
+  }
+}
+
+/// Builds a pollfd array; each entry is (fd:i32, events:i16, revents:i16).
+export function pollfds(entries: { fd: number; events: number }[]): { buffer: Uint8Array; revents: (index: number) => number } {
+  const buffer = new Uint8Array(8 * entries.length);
+  const view = new DataView(buffer.buffer);
+  entries.forEach((entry, i) => {
+    view.setInt32(i * 8, entry.fd, true);
+    view.setInt16(i * 8 + 4, entry.events, true);
+  });
+  return { buffer, revents: (index) => view.getInt16(index * 8 + 6, true) };
+}
 
 export function errno(): number {
   const location = libc.symbols.__errno_location();
@@ -62,10 +87,20 @@ export interface L2capOptions {
   psm: number;
   security: SecurityLevel;
   receiveMtu?: number;
+  log?: (message: string) => void;
 }
 
-/// Creates, configures, and connects the socket. Blocking; run inside the worker.
-export function openL2cap(options: L2capOptions): number {
+/// Reads a u16 Bluetooth socket option (BT_SNDMTU is the peer's MTU, BT_RCVMTU ours).
+export function socketMtu(fd: number, option: number): number {
+  const value = new Uint16Array(1);
+  const length = new Uint32Array([2]);
+  return libc.symbols.getsockopt(fd, SOL_BLUETOOTH, option, ptr(value), ptr(length)) < 0 ? -1 : value[0]!;
+}
+
+/// Creates, configures, and connects the socket. Runs inside the worker. The connect is
+/// non-blocking so a byte on `wakeFd` can abort it; the kernel's own LE connect timeout
+/// otherwise decides how long an unreachable band takes to fail.
+export function openL2cap(options: L2capOptions, wakeFd?: number, timeoutMs = 40_000): number {
   const fd = libc.symbols.socket(AF_BLUETOOTH, SOCK_SEQPACKET | SOCK_CLOEXEC, BTPROTO_L2CAP);
   if (fd < 0) throw new Error(`Could not create an L2CAP socket: ${errnoMessage()}`);
   try {
@@ -79,11 +114,37 @@ export function openL2cap(options: L2capOptions): number {
     }
     const mtu = new Uint16Array([options.receiveMtu ?? 8192]);
     // Older kernels reject a receive MTU on unconnected LE sockets; the default still carries band frames.
-    libc.symbols.setsockopt(fd, SOL_BLUETOOTH, BT_RCVMTU, ptr(mtu), 2);
-    const remote = sockaddrL2(options.address, options.addressType === "random" ? BDADDR_LE_RANDOM : BDADDR_LE_PUBLIC, options.psm);
-    if (libc.symbols.connect(fd, ptr(remote), remote.length) < 0) {
-      throw new Error(`Could not open the band's L2CAP channel (PSM ${options.psm}): ${errnoMessage()}`);
+    if (libc.symbols.setsockopt(fd, SOL_BLUETOOTH, BT_RCVMTU, ptr(mtu), 2) < 0) {
+      options.log?.(`BT_RCVMTU ${mtu[0]} rejected: ${errnoMessage()}`);
     }
+    const remote = sockaddrL2(options.address, options.addressType === "random" ? BDADDR_LE_RANDOM : BDADDR_LE_PUBLIC, options.psm);
+    const flags = libc.symbols.fcntl(fd, F_GETFL, 0);
+    libc.symbols.fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    const describe = (code: number) => `Could not open the band's L2CAP channel (PSM ${options.psm}): ${errnoMessage(code)}`;
+    if (libc.symbols.connect(fd, ptr(remote), remote.length) < 0) {
+      const code = errno();
+      if (code !== EINPROGRESS) throw new Error(describe(code));
+      const entries = [{ fd, events: POLLOUT }, ...(wakeFd !== undefined ? [{ fd: wakeFd, events: POLLIN }] : [])];
+      const { buffer, revents } = pollfds(entries);
+      const started = Date.now();
+      for (;;) {
+        const remaining = timeoutMs - (Date.now() - started);
+        if (remaining <= 0) throw new Error(`Could not open the band's L2CAP channel (PSM ${options.psm}): timed out`);
+        const ready = libc.symbols.poll(ptr(buffer), BigInt(entries.length), remaining);
+        if (ready < 0 && errno() === EINTR) continue;
+        if (ready < 0) throw new Error(`poll failed while connecting: ${errnoMessage()}`);
+        if (wakeFd !== undefined && revents(1) & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) throw new L2capCancelled();
+        if (revents(0) & (POLLOUT | POLLERR | POLLHUP)) break;
+      }
+      const status = new Int32Array(1);
+      const length = new Uint32Array([4]);
+      if (libc.symbols.getsockopt(fd, SOL_SOCKET, SO_ERROR, ptr(status), ptr(length)) < 0) {
+        throw new Error(`getsockopt failed after connect: ${errnoMessage()}`);
+      }
+      if (status[0] !== 0) throw new Error(describe(status[0]!));
+    }
+    libc.symbols.fcntl(fd, F_SETFL, flags);
+    options.log?.(`L2CAP MTU: send ${socketMtu(fd, BT_SNDMTU)}, receive ${socketMtu(fd, BT_RCVMTU)}`);
     return fd;
   } catch (error) {
     libc.symbols.close(fd);
@@ -91,11 +152,14 @@ export function openL2cap(options: L2capOptions): number {
   }
 }
 
-export function writeAll(fd: number, data: Uint8Array): void {
+export function writeAll(fd: number, data: Uint8Array, maxSdu = Infinity): void {
   // SEQPACKET preserves message boundaries; one write is one SDU to the band.
-  const count = libc.symbols.write(fd, ptr(data), BigInt(data.length));
-  if (Number(count) !== data.length) {
-    throw new Error(`Could not write to the band: ${Number(count) < 0 ? errnoMessage() : "short write"}`);
+  for (let offset = 0; offset < data.length; offset += maxSdu) {
+    const chunk = data.subarray(offset, Math.min(data.length, offset + maxSdu));
+    const count = libc.symbols.write(fd, ptr(chunk), BigInt(chunk.length));
+    if (Number(count) !== chunk.length) {
+      throw new Error(`Could not write to the band: ${Number(count) < 0 ? errnoMessage() : "short write"}`);
+    }
   }
 }
 
@@ -110,7 +174,8 @@ export type WorkerCommand =
   // Tests hand the worker an already-connected descriptor (e.g. one end of a socketpair).
   | { type: "adopt"; fd: number; wakeFd: number };
 export type WorkerMessage =
-  | { type: "opened"; fd: number }
+  | { type: "opened"; fd: number; sendMtu: number }
+  | { type: "log"; message: string }
   | { type: "data"; bytes: ArrayBuffer }
   | { type: "closed"; reason?: string }
   | { type: "error"; message: string };
@@ -121,12 +186,14 @@ export class L2capChannel {
   private fd = -1;
   private wake: [number, number] | undefined;
   private closed = false;
+  private finished = false;
 
   constructor(
     private readonly handlers: {
       onOpen: () => void;
       onData: (bytes: Uint8Array) => void;
       onClose: (reason?: string) => void;
+      onLog?: (message: string) => void;
     },
   ) {}
 
@@ -148,11 +215,16 @@ export class L2capChannel {
   private launch(command: WorkerCommand): void {
     this.worker = new Worker(new URL("./l2cap-worker.ts", import.meta.url).href);
     this.worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
+      if (this.finished) return; // a late message from a worker that was already torn down
       const message = event.data;
       switch (message.type) {
         case "opened":
           this.fd = message.fd;
+          this.sendMtu = message.sendMtu > 0 ? message.sendMtu : Infinity;
           this.handlers.onOpen();
+          break;
+        case "log":
+          this.handlers.onLog?.(message.message);
           break;
         case "data":
           if (!this.closed) this.handlers.onData(new Uint8Array(message.bytes));
@@ -169,9 +241,12 @@ export class L2capChannel {
     this.worker.postMessage(command);
   }
 
+  /// The peer's MTU once connected; frames larger than this are split across SDUs.
+  sendMtu = Infinity;
+
   write(data: Uint8Array): void {
     if (this.closed || this.fd < 0 || data.length === 0) return;
-    writeAll(this.fd, data);
+    writeAll(this.fd, data, this.sendMtu);
   }
 
   close(): void {
@@ -184,6 +259,8 @@ export class L2capChannel {
   }
 
   private finish(reason?: string): void {
+    if (this.finished) return;
+    this.finished = true;
     const wasClosed = this.closed;
     this.closed = true;
     if (this.wake) {

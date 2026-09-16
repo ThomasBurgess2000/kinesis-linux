@@ -17,7 +17,10 @@ export class KinesisError extends Error {
   }
 }
 
-export type BandOperation = { kind: "scan"; seconds: number } | { kind: "connect"; band: BandDevice; security: SecurityLevel };
+export interface SessionOptions { configChannel?: number; phasedLinkSetup?: boolean }
+export type BandOperation =
+  | { kind: "scan"; seconds: number }
+  | { kind: "connect"; band: BandDevice; security: SecurityLevel; session?: SessionOptions };
 
 export interface Logger {
   info(message: string): void;
@@ -88,13 +91,13 @@ export class BandConnection {
     this.failure = undefined;
     this.onEvent = onEvent;
     this.onEnd = onEnd;
-    this.deadline = now() + 30;
+    this.deadline = now() + 75;
     this.lastReadAt = now();
     this.timer = setInterval(() => this.tick(), 500);
     if (operation.kind === "scan") {
       this.scan(operation.seconds).catch((error: unknown) => this.fail(error));
     } else {
-      this.connect(operation.band, operation.security).catch((error: unknown) => this.fail(error));
+      this.connect(operation.band, operation.security, operation.session ?? {}).catch((error: unknown) => this.fail(error));
     }
   }
 
@@ -132,31 +135,43 @@ export class BandConnection {
     this.disconnect();
   }
 
-  private async connect(band: BandDevice, security: SecurityLevel): Promise<void> {
-    const adapter = await bluez.adapterPath();
-    const device = bluez.devicePath(adapter, band.address);
-    this.device = device;
+  private async connect(band: BandDevice, security: SecurityLevel, session: SessionOptions): Promise<void> {
     this.emit({ payload: { type: "preparing" }, receivedAt: now() });
-    const known = await bluez.knownDevice(band.address);
-    if (!known) throw new KinesisError("BlueZ doesn't know this band yet. Put it in pairing mode and run `kinesis scan`.");
-    this.log.info(`Connecting to ${band.name} (${band.address}, ${known.addressType})`);
+    // A leftover discovery or half-open link causes le-connection-abort-by-local; clear both first.
+    await bluez.stopDiscovery().catch(() => {});
+    const found = await bluez.findDevice(band);
+    if (!found) throw new KinesisError("BlueZ doesn't know this band yet. Put it in pairing mode and run `kinesis scan`.");
+    const { path: device } = found;
+    this.device = device;
+    if ((await bluez.deviceState(device).catch(() => undefined))?.connected) {
+      await bluez.disconnect(device);
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    if (this.disconnecting) return;
+    this.log.info(`Connecting to ${found.device.name || band.name} (${found.device.address}, ${found.device.addressType})`);
     await bluez.connect(device);
     if (this.disconnecting) return;
     this.log.info("Band services discovered");
+    // BlueZ's own connect can take a while; give the L2CAP open and handshake a fresh window.
+    this.deadline = now() + 30;
     if (!(await bluez.hasService(device, bluez.BAND_SERVICE))) {
       throw new KinesisError("This device doesn't expose the band input service");
     }
     const psm = await this.readPsm(device);
     if (this.disconnecting) return;
-    this.log.info(`Opening L2CAP channel on PSM ${psm}`);
+    // Pairing during service discovery can reveal the band's identity address; use what BlueZ has now.
+    const resolved = (await bluez.findDevice(band))?.device ?? found.device;
+    this.emit({ payload: { type: "devices", devices: [resolved] }, receivedAt: now() });
+    this.log.info(`Opening L2CAP channel on PSM ${psm} to ${resolved.address} (${resolved.addressType})`);
     this.nextBatteryRead = now();
     const channel = new L2capChannel({
-      onOpen: () => this.opened(),
-      onData: (bytes) => this.readInput(bytes),
-      onClose: (reason) => this.channelClosed(reason),
+      onOpen: () => { if (this.channel === channel) this.opened(session); },
+      onData: (bytes) => { if (this.channel === channel) this.readInput(bytes); },
+      onClose: (reason) => { if (this.channel === channel) this.channelClosed(reason); },
+      onLog: (message) => this.log.info(message),
     });
     this.channel = channel;
-    channel.open({ address: band.address, addressType: known.addressType, psm, security });
+    channel.open({ address: resolved.address, addressType: resolved.addressType, psm, security });
   }
 
   private async readPsm(device: string): Promise<number> {
@@ -178,11 +193,12 @@ export class BandConnection {
     return value[0]! | (value[1]! << 8);
   }
 
-  private opened(): void {
+  private opened(session: SessionOptions): void {
     if (this.disconnecting) return;
     try {
       this.log.info("L2CAP channel opened");
-      this.session = new BandSession();
+      this.session = new BandSession(session);
+      this.session.onFrame = (frame) => this.log.info(`  frame ch=0x${frame.channel.toString(16)} words=[${frame.words.map((w) => "0x" + w.toString(16)).join(",")}] len=${frame.length}${frame.payload.length ? " payload=" + Array.from(frame.payload.subarray(0, 48), (b) => b.toString(16).padStart(2, "0")).join("") : ""}`);
       this.channel?.write(this.session.request());
     } catch (error) {
       this.fail(error);
@@ -200,7 +216,8 @@ export class BandConnection {
       const result = session.feed(bytes, time);
       if (!wasAuthenticated && session.authenticatedPackets > 0) this.log.info("Encrypted packet verified");
       if (!wasEnabled && session.streamsEnabled) this.log.notice("Band acknowledged gesture and motion subscription");
-      if (result.outgoing.length) this.channel?.write(result.outgoing);
+      // One AirShield record per SDU: the band's framing does not reassemble across writes.
+      for (const packet of result.packets) this.channel?.write(packet);
       for (const event of result.events) {
         if (event.payload.type === "connected") {
           this.deadline = Infinity;

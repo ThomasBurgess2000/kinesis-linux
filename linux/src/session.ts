@@ -51,13 +51,17 @@ export class BandSession {
   // Keep these together: enable, disable, and acknowledgement must agree.
   private readonly streamFields = [3, 6, 8];
   private readonly streamChannel = 0x8005;
-  private readonly configurationChannel = 0x8006;
+  private readonly configurationChannel: number;
+  private readonly phasedLinkSetup: boolean;
+  private phaseTwoSent = false;
   private configurationID = 0n;
   private handRequest: HandRequest | undefined;
   hand: BandHand | undefined;
 
-  constructor() {
+  constructor(options: { configChannel?: number; phasedLinkSetup?: boolean } = {}) {
     this.ecdh.generateKeys();
+    this.configurationChannel = options.configChannel ?? 0x8006;
+    this.phasedLinkSetup = options.phasedLinkSetup ?? false;
   }
 
   private get publicKey(): Uint8Array {
@@ -70,7 +74,10 @@ export class BandSession {
       BandWire.field(4, 31), BandWire.field(7, 16)));
   }
 
-  feed(bytes: Uint8Array, time: number): { outgoing: Uint8Array; events: BandEvent[] } {
+  /// Diagnostics hook: called for every decoded DataX frame (no plaintext payload is exposed).
+  onFrame: ((frame: { channel: number; words: number[]; length: number; payload: Uint8Array }) => void) | undefined;
+
+  feed(bytes: Uint8Array, time: number): { outgoing: Uint8Array; packets: Uint8Array[]; events: BandEvent[] } {
     this.pending = concat(this.pending, bytes);
     const outgoing: Uint8Array[] = [];
     let events: BandEvent[] = [];
@@ -115,11 +122,9 @@ export class BandSession {
           outgoing.push(this.encrypt(BandWire.frame(0x8002, [0x81000024, 0x02003000])));
           outgoing.push(this.encrypt(BandWire.frame(0x8001, [0x02001000], concat(
             BandWire.field(1, 1), BandWire.field(2, new Uint8Array(randomBytes(16)))))));
-          outgoing.push(this.encrypt(BandWire.frame(0x8003, [0x8100ce56, 0x02000314], concat(
-            BandWire.field(1, 1), BandWire.field(3, new Uint8Array())))));
-          outgoing.push(this.streamRequest(2n, undefined));
-          outgoing.push(this.streamRequest(3n, true));
-          outgoing.push(this.requestHand(undefined, true, time));
+          // Pipelined (older firmware): subscribe in the same batch. Phased (newer firmware):
+          // wait for the band's link-setup reply on channel 1 before the 0xce56 requests.
+          if (!this.phasedLinkSetup) this.sendPhaseTwo(outgoing, time);
           break;
         }
         default:
@@ -132,6 +137,12 @@ export class BandSession {
       for (const plaintext of records) {
         this.authenticatedPackets += 1;
         for (const frame of this.datax.feed(plaintext)) {
+          this.onFrame?.({ channel: frame.channel, words: frame.words, length: frame.payload.length, payload: frame.payload });
+          // Phased link setup: the band's EndLinkSetup reply arrives on channel 1; only then subscribe.
+          if (this.phasedLinkSetup && !this.phaseTwoSent && !this.stopping && (frame.channel & 0x7fff) === 1
+            && frame.words.some((w) => w === 0x02001000)) {
+            this.sendPhaseTwo(outgoing, time);
+          }
           events = events.concat(this.input(frame, time, outgoing));
         }
         if (this.streaming && !this.stopping && time - this.lastHeartbeat >= 0.2) {
@@ -140,7 +151,7 @@ export class BandSession {
         }
       }
     }
-    return { outgoing: concat(...outgoing), events };
+    return { outgoing: concat(...outgoing), packets: outgoing, events };
   }
 
   tick(time: number): BandEvent[] {
@@ -226,6 +237,17 @@ export class BandSession {
   private encrypt(data: Uint8Array): Uint8Array {
     if (!this.transmitter) throw new BandProtocolError("Band encryption is not ready");
     return this.transmitter.encrypt(data);
+  }
+
+  /// The 0xce56 requests that need link setup complete: device info, subscription, hand read.
+  private sendPhaseTwo(outgoing: Uint8Array[], time: number): void {
+    if (this.phaseTwoSent) return;
+    this.phaseTwoSent = true;
+    outgoing.push(this.encrypt(BandWire.frame(0x8003, [0x8100ce56, 0x02000314], concat(
+      BandWire.field(1, 1), BandWire.field(3, new Uint8Array())))));
+    outgoing.push(this.streamRequest(2n, undefined));
+    outgoing.push(this.streamRequest(3n, true));
+    outgoing.push(this.requestHand(undefined, true, time));
   }
 
   private streamRequest(id: bigint, enabled: boolean | undefined): Uint8Array {

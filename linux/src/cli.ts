@@ -27,7 +27,8 @@ usage:
 
 config keys: swipes.left|right|up|down  taps.indexTap|indexDoubleTap|middleTap|middleDoubleTap
              dial.target (none|volume|brightness)  dial.sensitivity (0.5–4)  backend (auto|kde|command)
-             security (low|medium|high)  commands.<action> (JSON array of argv)
+             security (low|medium|high)  linkSetup (pipelined|phased)  configChannel (e.g. 0x8006)
+             commands.<action> (JSON array of argv)
 
 unpair the band from the Meta AI app first, then put it in pairing mode.`;
 
@@ -45,8 +46,9 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-function describe(device: BandDevice): string {
-  return `${device.name || "Meta Band"}  ${device.address}  ${device.addressType}${device.rssi !== undefined ? `  rssi ${device.rssi}` : "  (not advertising)"}`;
+function describe(device: BandDevice, scanning = false): string {
+  const signal = device.rssi !== undefined ? `  rssi ${device.rssi}` : scanning ? "  (not advertising)" : "";
+  return `${device.name || "Meta Band"}  ${device.address}  ${device.addressType}${signal}`;
 }
 
 async function scan(args: string[]): Promise<void> {
@@ -56,7 +58,7 @@ async function scan(args: string[]): Promise<void> {
   console.log(`Scanning for ${seconds}s. Put the band in pairing mode and keep it nearby.`);
   let shown = 0;
   const devices = await bluez.scan(seconds, (found) => {
-    for (const device of found.slice(shown)) console.log(`  found ${describe(device)}`);
+    for (const device of found.slice(shown)) console.log(`  found ${describe(device, true)}`);
     shown = found.length;
   });
   if (devices.length === 0) fail("No band found. Put it in pairing mode, keep it nearby, and try again.");
@@ -111,6 +113,13 @@ async function run(args: string[]): Promise<void> {
       console.log(`${stamp()} band hand: ${hand}`);
       if (config.hand !== hand) { config.hand = hand; await saveConfig(config); }
     },
+    onBandResolved: async (device) => {
+      if (config.band && config.band.address !== device.address) {
+        console.log(`${stamp()} band identity resolved: ${device.address} (${device.addressType})`);
+        config.band = { address: device.address, addressType: device.addressType, name: device.name || config.band.name };
+        await saveConfig(config);
+      }
+    },
   });
   const onAction = setInterval(() => {
     const action = controller.state.lastAction;
@@ -122,7 +131,7 @@ async function run(args: string[]): Promise<void> {
   console.log(`Connecting to ${describe(band)} with the ${backend.name} backend${values.practice ? " (practice: actions are only printed)" : ""}.`);
   controller.connect(band, { enableControls: true });
   const shutdown = async () => {
-    console.log(`\n${stamp()} Disconnecting…`);
+    console.log("");
     clearInterval(onAction);
     await controller.disconnect();
     process.exit(0);
@@ -210,6 +219,13 @@ async function configCommand(args: string[]): Promise<void> {
   } else if (group === "security" && !name) {
     if (value !== "low" && value !== "medium" && value !== "high") fail("security must be low, medium, or high");
     config.security = value;
+  } else if (group === "linkSetup" && !name) {
+    if (value !== "pipelined" && value !== "phased") fail("linkSetup must be pipelined or phased");
+    config.linkSetup = value;
+  } else if (group === "configChannel" && !name) {
+    const channel = value.startsWith("0x") ? parseInt(value, 16) : Number(value);
+    if (!Number.isInteger(channel) || channel <= 0 || channel > 0xffff) fail("configChannel must be a 16-bit number, e.g. 0x8006 or 0x8007");
+    config.configChannel = channel;
   } else if (group === "commands" && name) {
     if (!isAction(name)) fail(`Unknown action "${name}"`);
     let argv: unknown;

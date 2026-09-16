@@ -104,10 +104,38 @@ export async function scan(seconds: number, onProgress?: (found: BandDevice[]) =
   return [...found.values()].sort((a, b) => (b.rssi ?? -127) - (a.rssi ?? -127));
 }
 
+export async function stopDiscovery(): Promise<void> {
+  const adapter = await adapterPath();
+  const props = (await objects()).get(adapter)?.get("org.bluez.Adapter1");
+  if (props && getBoolean(props, "Discovering") === true) {
+    await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "StopDiscovery"], 10).catch(() => {});
+  }
+}
+
 export async function knownDevice(address: string): Promise<BandDevice | undefined> {
   const adapter = await adapterPath();
   const props = (await objects()).get(devicePath(adapter, address))?.get("org.bluez.Device1");
   return props ? deviceFrom(props) : undefined;
+}
+
+/// Finds the saved band in BlueZ's cache. The band advertises with a rotating private address;
+/// once BlueZ bonds with it the Device1 Address becomes the identity address while the object
+/// path may keep the old one, so match by address, then path, then unique name.
+export async function findDevice(saved: BandDevice): Promise<{ path: string; device: BandDevice } | undefined> {
+  const adapter = await adapterPath();
+  const candidates: { path: string; device: BandDevice }[] = [];
+  for (const [path, ifaces] of await objects()) {
+    if (!path.startsWith(adapter + "/dev_")) continue;
+    const props = ifaces.get("org.bluez.Device1");
+    const device = props && deviceFrom(props);
+    if (device) candidates.push({ path, device });
+  }
+  const byAddress = candidates.find((c) => c.device.address.toUpperCase() === saved.address.toUpperCase());
+  if (byAddress) return byAddress;
+  const byPath = candidates.find((c) => c.path === devicePath(adapter, saved.address));
+  if (byPath) return byPath;
+  const byName = candidates.filter((c) => saved.name && c.device.name === saved.name);
+  return byName.length === 1 ? byName[0] : undefined;
 }
 
 async function property(path: string, iface: string, name: string): Promise<unknown> {
@@ -136,9 +164,9 @@ export async function deviceState(path: string): Promise<DeviceState> {
 }
 
 /// Connect the LE link through BlueZ so GATT is available and the L2CAP socket can share the ACL.
-export async function connect(path: string, timeoutSeconds = 30): Promise<void> {
+export async function connect(path: string, timeoutSeconds = 60): Promise<void> {
   await busctl(["call", "org.bluez", path, "org.bluez.Device1", "Connect"], timeoutSeconds);
-  const deadline = Date.now() + 20_000;
+  const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     if ((await property(path, "org.bluez.Device1", "ServicesResolved")) === true) return;
     await Bun.sleep(250);

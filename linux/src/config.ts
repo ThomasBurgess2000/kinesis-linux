@@ -18,6 +18,8 @@ export interface Config {
   backend: "auto" | "kde" | "command";
   commands: Partial<Record<Action, string[]>>;
   security: SecurityLevel;
+  linkSetup: "pipelined" | "phased";
+  configChannel: number;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -27,6 +29,8 @@ export const DEFAULT_CONFIG: Config = {
   backend: "auto",
   commands: {},
   security: "low",
+  linkSetup: "pipelined",
+  configChannel: 0x8006,
 };
 
 export function configPath(): string {
@@ -69,6 +73,10 @@ export function normalize(raw: unknown): Config {
     }
   }
   if (raw.security === "low" || raw.security === "medium" || raw.security === "high") config.security = raw.security;
+  if (raw.linkSetup === "pipelined" || raw.linkSetup === "phased") config.linkSetup = raw.linkSetup;
+  if (typeof raw.configChannel === "number" && Number.isInteger(raw.configChannel) && raw.configChannel > 0 && raw.configChannel <= 0xffff) {
+    config.configChannel = raw.configChannel;
+  }
   return config;
 }
 

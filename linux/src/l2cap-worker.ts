@@ -2,13 +2,13 @@
 // byte to the pipe to ask for shutdown. Each received SDU is posted to the main thread.
 
 import { ptr } from "bun:ffi";
-import { type WorkerCommand, type WorkerMessage, errno as ffiErrno, errnoMessage, libc, openL2cap } from "./l2cap";
+import {
+  BT_SNDMTU, L2capCancelled, POLLERR, POLLHUP, POLLIN, POLLNVAL, type WorkerCommand, type WorkerMessage,
+  errno as ffiErrno, errnoMessage, libc, openL2cap, socketMtu,
+} from "./l2cap";
 
 declare const self: Worker;
 
-const POLLIN = 0x001;
-const POLLERR = 0x008;
-const POLLHUP = 0x010;
 const EINTR = 4;
 
 function post(message: WorkerMessage, transfer: ArrayBuffer[] = []): void {
@@ -22,13 +22,14 @@ self.onmessage = (event: MessageEvent<WorkerCommand>) => {
     fd = command.fd;
   } else {
     try {
-      fd = openL2cap(command.options);
+      fd = openL2cap({ ...command.options, log: (message) => post({ type: "log", message }) }, command.wakeFd);
     } catch (error) {
-      post({ type: "error", message: error instanceof Error ? error.message : String(error) });
+      if (error instanceof L2capCancelled) post({ type: "closed" });
+      else post({ type: "error", message: error instanceof Error ? error.message : String(error) });
       return;
     }
   }
-  post({ type: "opened", fd });
+  post({ type: "opened", fd, sendMtu: command.type === "open" ? socketMtu(fd, BT_SNDMTU) : -1 });
   const fds = new Uint8Array(16);
   const view = new DataView(fds.buffer);
   view.setInt32(0, fd, true);
@@ -48,7 +49,7 @@ self.onmessage = (event: MessageEvent<WorkerCommand>) => {
       break;
     }
     const wakeEvents = view.getInt16(14, true);
-    if (wakeEvents & (POLLIN | POLLHUP | POLLERR)) break; // shutdown requested
+    if (wakeEvents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) break; // shutdown requested
     const socketEvents = view.getInt16(6, true);
     if (socketEvents & POLLIN) {
       const count = Number(libc.symbols.read(fd, ptr(buffer), BigInt(buffer.length)));
