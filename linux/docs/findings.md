@@ -127,3 +127,19 @@ idle band on a desk sends only subscription-status frames and then drops the str
 - Bonding hurt reconnection here: once bonded, `Connect` to the identity address timed out while
   the band advertised a fresh resolvable-private address. Removing the bond and connecting fresh
   worked. The app should probably not pair unless the PSM read demands it.
+
+## Definitive: the 0xc001 gate is not clearable client-side (even factory reset)
+
+Tested every state:
+- Immediately after a Meta-app deregistration ("re-add, then remove while connected"): the input
+  service opened once — streams enabled with flags 3/6/8, hand read, device-info all succeeded.
+- Every later session (unbonded, bonded, fresh pairing mode): `0x0300c001` on all input requests.
+- After a full **factory reset** of the band: still `0x0300c001`. Handshake and decryption work;
+  the input service stays gated.
+
+Conclusion: the input-service gate is an authentication/activation requirement in this firmware,
+not owner/bond state a client can clear. The single working run was a transient post-deregistration
+window that is not reproducible on demand. Getting past it needs the owner-authentication step the
+upstream POC also left unsolved — out of reach for a third-party client. The Linux transport,
+handshake, decryption, and (in that one window) the full subscription are all proven; this gate is
+the sole remaining blocker and it is on the band, not in this code.
