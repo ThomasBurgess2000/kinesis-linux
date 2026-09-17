@@ -143,3 +143,20 @@ window that is not reproducible on demand. Getting past it needs the owner-authe
 upstream POC also left unsolved — out of reach for a third-party client. The Linux transport,
 handshake, decryption, and (in that one window) the full subscription are all proven; this gate is
 the sole remaining blocker and it is on the band, not in this code.
+
+## CONFIRMED WORKING END TO END (2026-09-17)
+
+Correction to the section above: the gate is clearable, and the working recipe is reproducible.
+A factory reset is the wrong move (it leaves the band un-activated and locked). The right one:
+
+1. Set the band up fully in the Meta AI app (let it activate).
+2. With the band still connected to the phone, remove/forget it in the app.
+3. Connect from Linux in the window right after (`kinesis run`, scanner already waiting).
+
+Result on real hardware: streams enabled, hand confirmed, and live gestures recognized and mapped:
+index double tap -> play/pause, swipe left -> previous desktop, swipe right -> next desktop, with
+~1000 gyro/orientation frames in a few seconds. The full Linux path works.
+
+Remaining issue: the stream stopped after ~9 s of input and the band would not accept a reconnect
+afterward, so the open window is short and the band re-locks. Keeping the session alive across
+that is the next problem; the port itself is proven.
