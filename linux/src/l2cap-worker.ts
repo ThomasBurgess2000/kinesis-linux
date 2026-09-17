@@ -38,10 +38,19 @@ self.onmessage = (event: MessageEvent<WorkerCommand>) => {
   view.setInt16(12, POLLIN, true);
   const buffer = new Uint8Array(65_536);
   let reason: string | undefined;
+  // Read-rate telemetry: SDUs and bytes per 2 s window, and the largest single read. A read that
+  // returns a big backlog means the reader fell behind (a credit-starvation risk for LE CoC).
+  let sdus = 0, bytes = 0, largest = 0, windowStart = Date.now();
   for (;;) {
     view.setInt16(6, 0, true);
     view.setInt16(14, 0, true);
-    const ready = libc.symbols.poll(ptr(fds), 2n, -1);
+    const ready = libc.symbols.poll(ptr(fds), 2n, 2000);
+    const elapsed = Date.now() - windowStart;
+    if (elapsed >= 2000) {
+      if (sdus > 0) post({ type: "log", message: `rx ${sdus} sdus / ${bytes} B in ${elapsed} ms (largest read ${largest} B)` });
+      sdus = 0; bytes = 0; largest = 0; windowStart = Date.now();
+    }
+    if (ready === 0) continue;
     if (ready < 0) {
       const code = ffiErrno();
       if (code === EINTR) continue;
@@ -60,6 +69,7 @@ self.onmessage = (event: MessageEvent<WorkerCommand>) => {
         reason = `Could not read band input: ${errnoMessage(code)}`;
         break;
       }
+      sdus += 1; bytes += count; if (count > largest) largest = count;
       const copy = buffer.slice(0, count);
       post({ type: "data", bytes: copy.buffer }, [copy.buffer]);
     } else if (socketEvents & (POLLHUP | POLLERR)) {

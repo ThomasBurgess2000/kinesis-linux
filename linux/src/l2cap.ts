@@ -34,7 +34,7 @@ export const libc = dlopen("libc.so.6", {
 });
 
 const F_GETFL = 3, F_SETFL = 4, O_NONBLOCK = 0o4000, EINPROGRESS = 115, EINTR = 4;
-const SOL_SOCKET = 1, SO_ERROR = 4;
+const SOL_SOCKET = 1, SO_ERROR = 4, SO_RCVBUF = 8;
 export const POLLIN = 0x001, POLLOUT = 0x004, POLLERR = 0x008, POLLHUP = 0x010, POLLNVAL = 0x020;
 
 export class L2capCancelled extends Error {
@@ -87,6 +87,7 @@ export interface L2capOptions {
   psm: number;
   security: SecurityLevel;
   receiveMtu?: number;
+  receiveBuffer?: number;
   connectTimeoutMs?: number;
   log?: (message: string) => void;
 }
@@ -112,6 +113,12 @@ export function openL2cap(options: L2capOptions, wakeFd?: number, timeoutMs = op
     const security = new Uint8Array([SECURITY_LEVELS[options.security], 0]);
     if (libc.symbols.setsockopt(fd, SOL_BLUETOOTH, BT_SECURITY, ptr(security), security.length) < 0) {
       throw new Error(`Could not set the L2CAP security level: ${errnoMessage()}`);
+    }
+    // LE CoC credits are returned to the peer only as this socket drains; a bigger receive buffer
+    // keeps credits flowing across scheduling hiccups. The kernel clamps this to net.core.rmem_max.
+    const rcvbuf = new Int32Array([options.receiveBuffer ?? 4 * 1024 * 1024]);
+    if (libc.symbols.setsockopt(fd, SOL_SOCKET, SO_RCVBUF, ptr(rcvbuf), 4) < 0) {
+      options.log?.(`SO_RCVBUF rejected: ${errnoMessage()}`);
     }
     const mtu = new Uint16Array([options.receiveMtu ?? 8192]);
     // Older kernels reject a receive MTU on unconnected LE sockets; the default still carries band frames.
@@ -145,7 +152,9 @@ export function openL2cap(options: L2capOptions, wakeFd?: number, timeoutMs = op
       if (status[0] !== 0) throw new Error(describe(status[0]!));
     }
     libc.symbols.fcntl(fd, F_SETFL, flags);
-    options.log?.(`L2CAP MTU: send ${socketMtu(fd, BT_SNDMTU)}, receive ${socketMtu(fd, BT_RCVMTU)}`);
+    const effective = new Int32Array(1); const elen = new Uint32Array([4]);
+    libc.symbols.getsockopt(fd, SOL_SOCKET, SO_RCVBUF, ptr(effective), ptr(elen));
+    options.log?.(`L2CAP MTU: send ${socketMtu(fd, BT_SNDMTU)}, receive ${socketMtu(fd, BT_RCVMTU)}; socket rcvbuf ${effective[0]} B`);
     return fd;
   } catch (error) {
     libc.symbols.close(fd);

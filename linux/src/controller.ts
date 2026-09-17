@@ -350,7 +350,13 @@ export class Controller {
   private tick(): void {
     if (!this.wantsConnection || !this.busy) return;
     const silentFor = this.clock() - (this.heartbeat ?? this.started);
-    if (silentFor > (this.heartbeat === undefined ? 50 : 8)) {
+    // KINESIS_STALL overrides the 8 s no-input teardown (diagnostics: see whether the band is
+    // still answering status queries before we tear the session down ourselves).
+    const stallAfter = Number(process.env.KINESIS_STALL ?? 8);
+    // Before the first heartbeat, allow the whole discovery window plus connect/handshake time,
+    // otherwise a long KINESIS_DISCOVER gets chopped into 50 s restarts with gaps between them.
+    const startupAllowance = Math.max(50, Number(process.env.KINESIS_DISCOVER ?? 60) + 40);
+    if (silentFor > (this.heartbeat === undefined ? startupAllowance : stallAfter)) {
       if (this.state.live) {
         this.state.live = false;
         this.suspendActions();

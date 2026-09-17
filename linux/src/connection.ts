@@ -299,7 +299,7 @@ export class BandConnection {
         try {
           const query = session.queryStreamState();
           this.lastStatusQuery = time;
-          if (query.length) this.channel?.write(query);
+          if (query.length) { this.log.info(`No input for ${(time - this.lastReadAt).toFixed(1)}s; sending status query`); this.channel?.write(query); }
         } catch (error) {
           this.fail(error);
         }
