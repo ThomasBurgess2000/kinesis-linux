@@ -20,6 +20,7 @@ export interface Config {
   security: SecurityLevel;
   linkSetup: "pipelined" | "phased";
   configChannel: number;
+  bond: boolean;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -31,6 +32,7 @@ export const DEFAULT_CONFIG: Config = {
   security: "low",
   linkSetup: "pipelined",
   configChannel: 0x8006,
+  bond: true,
 };
 
 export function configPath(): string {
@@ -77,6 +79,7 @@ export function normalize(raw: unknown): Config {
   if (typeof raw.configChannel === "number" && Number.isInteger(raw.configChannel) && raw.configChannel > 0 && raw.configChannel <= 0xffff) {
     config.configChannel = raw.configChannel;
   }
+  if (typeof raw.bond === "boolean") config.bond = raw.bond;
   return config;
 }
 

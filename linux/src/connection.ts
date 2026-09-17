@@ -20,7 +20,7 @@ export class KinesisError extends Error {
 export interface SessionOptions { configChannel?: number; phasedLinkSetup?: boolean }
 export type BandOperation =
   | { kind: "scan"; seconds: number }
-  | { kind: "connect"; band: BandDevice; security: SecurityLevel; session?: SessionOptions };
+  | { kind: "connect"; band: BandDevice; security: SecurityLevel; session?: SessionOptions; bond?: boolean };
 
 export interface Logger {
   info(message: string): void;
@@ -97,7 +97,7 @@ export class BandConnection {
     if (operation.kind === "scan") {
       this.scan(operation.seconds).catch((error: unknown) => this.fail(error));
     } else {
-      this.connect(operation.band, operation.security, operation.session ?? {}).catch((error: unknown) => this.fail(error));
+      this.connect(operation.band, operation.security, operation.session ?? {}, operation.bond ?? true).catch((error: unknown) => this.fail(error));
     }
   }
 
@@ -135,21 +135,38 @@ export class BandConnection {
     this.disconnect();
   }
 
-  private async connect(band: BandDevice, security: SecurityLevel, session: SessionOptions): Promise<void> {
+  private async connect(band: BandDevice, security: SecurityLevel, session: SessionOptions, bond: boolean): Promise<void> {
     this.emit({ payload: { type: "preparing" }, receivedAt: now() });
     // A leftover discovery or half-open link causes le-connection-abort-by-local; clear both first.
     await bluez.stopDiscovery().catch(() => {});
     // The band's connectable window after a button press is short, and its advertising address
     // may not resolve to the saved identity until bonded. Scan until it advertises, then connect.
-    const found = await bluez.discoverBand(band, 25);
+    const found = await bluez.discoverBand(band, Number(process.env.KINESIS_DISCOVER ?? 60));
     if (!found) throw new KinesisError("The band isn't advertising. Put it in pairing mode (press its button) and try again.");
-    const { path: device } = found;
+    let device = found.path;
     this.device = device;
     if (this.disconnecting) return;
     this.log.info(`Connecting to ${found.device.name || band.name} (${found.device.address}, ${found.device.addressType})`);
     await bluez.connect(device);
     if (this.disconnecting) return;
     this.log.info("Band services discovered");
+    // Bond so the band remembers this host and future connects don't need a button press.
+    // Pairing can move the device from the advertised address path to its identity path, so
+    // re-resolve to the connected object afterward and use that path from here on. Best effort.
+    if (bond) {
+      const state = await bluez.deviceState(device).catch(() => undefined);
+      if (state && !state.bonded) {
+        this.log.info("Bonding with the band");
+        try {
+          await bluez.pair(device);
+        } catch (e) {
+          this.log.info(`Bonding skipped: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        const reconnected = await bluez.connectedBand().catch(() => undefined);
+        if (reconnected) { device = reconnected.path; this.device = device; }
+      }
+    }
+    if (this.disconnecting) return;
     // BlueZ's own connect can take a while; give the L2CAP open and handshake a fresh window.
     this.deadline = now() + 30;
     if (!(await bluez.hasService(device, bluez.BAND_SERVICE))) {

@@ -87,7 +87,7 @@ export class Controller {
     this.enableWhenLive = options.enableControls;
     this.retries = 0;
     this.ticker ??= setInterval(() => this.tick(), 500);
-    this.run({ kind: "connect", band, security: this.config.security, session: this.sessionOptions });
+    this.run({ kind: "connect", band, security: this.config.security, session: this.sessionOptions, bond: this.config.bond });
   }
 
   async disconnect(): Promise<void> {
@@ -327,7 +327,7 @@ export class Controller {
     this.retry = setTimeout(() => {
       this.retry = undefined;
       if (!this.wantsConnection || this.quitting || !this.band) return;
-      this.run({ kind: "connect", band: this.band, security: this.config.security, session: this.sessionOptions });
+      this.run({ kind: "connect", band: this.band, security: this.config.security, session: this.sessionOptions, bond: this.config.bond });
     }, delay * 1000);
   }
 

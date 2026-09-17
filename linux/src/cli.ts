@@ -114,9 +114,10 @@ async function run(args: string[]): Promise<void> {
       if (config.hand !== hand) { config.hand = hand; await saveConfig(config); }
     },
     onBandResolved: async (device) => {
-      if (config.band && config.band.address !== device.address) {
-        console.log(`${stamp()} band identity resolved: ${device.address} (${device.addressType})`);
-        config.band = { address: device.address, addressType: device.addressType, name: device.name || config.band.name };
+      // Only persist a stable public identity address; the advertised random address rotates.
+      if (device.addressType === "public" && config.band && config.band.address !== device.address) {
+        console.log(`${stamp()} band identity resolved: ${device.address}`);
+        config.band = { address: device.address, addressType: "public", name: device.name || config.band.name };
         await saveConfig(config);
       }
     },

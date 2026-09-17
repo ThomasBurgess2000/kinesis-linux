@@ -111,16 +111,32 @@ export async function discoverBand(saved: BandDevice, seconds: number): Promise<
   const adapter = await adapterPath();
   const deadline = Date.now() + seconds * 1000;
   while (Date.now() < deadline) {
-    const seen = await scan(4).catch(() => [] as BandDevice[]);
-    const advertising = seen.find((d) => d.address.toUpperCase() === saved.address.toUpperCase() && d.rssi !== undefined)
-      ?? seen.find((d) => d.rssi !== undefined);
-    if (advertising) {
+    let started = false;
+    try {
+      await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "StartDiscovery"]);
+      started = true;
+    } catch { /* someone else is discovering; still enumerate */ }
+    await Bun.sleep(4000);
+    // Use the real object path from BlueZ, not one reconstructed from the address: a resolved
+    // identity address can report at a different path than dev_<ADDR>, and connecting to the
+    // reconstructed path hits a phantom object ("Method Connect ... doesn't exist").
+    const candidates: { path: string; device: BandDevice }[] = [];
+    for (const [path, ifaces] of await objects()) {
+      if (!path.startsWith(adapter + "/dev_")) continue;
+      const props = ifaces.get("org.bluez.Device1");
+      const device = props && deviceFrom(props);
+      if (device && isBandName(device.name) && device.rssi !== undefined) candidates.push({ path, device });
+    }
+    const chosen = candidates.find((c) => c.device.address.toUpperCase() === saved.address.toUpperCase()) ?? candidates[0];
+    if (chosen) {
       await stopDiscovery().catch(() => {});
       for (let i = 0; i < 20 && (await isDiscovering().catch(() => false)); i++) await Bun.sleep(250);
       await Bun.sleep(500);
-      return { path: devicePath(adapter, advertising.address), device: advertising };
+      return chosen;
     }
+    if (!started) await Bun.sleep(1000);
   }
+  await stopDiscovery().catch(() => {});
   return undefined;
 }
 
@@ -147,6 +163,18 @@ export async function knownDevice(address: string): Promise<BandDevice | undefin
 export async function deviceByPath(path: string): Promise<BandDevice | undefined> {
   const props = (await objects()).get(path)?.get("org.bluez.Device1");
   return props ? deviceFrom(props) : undefined;
+}
+
+/// The currently-connected Meta Band object. After pairing, BlueZ may move the device from the
+/// advertised random-address path to its identity path, so callers must re-resolve by connection.
+export async function connectedBand(): Promise<{ path: string; device: BandDevice } | undefined> {
+  for (const [path, ifaces] of await objects()) {
+    const props = ifaces.get("org.bluez.Device1");
+    if (!props || getBoolean(props, "Connected") !== true) continue;
+    const device = deviceFrom(props);
+    if (device && isBandName(device.name)) return { path, device };
+  }
+  return undefined;
 }
 
 /// Finds the saved band in BlueZ's cache. The band advertises with a rotating private address;

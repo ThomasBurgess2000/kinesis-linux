@@ -110,11 +110,16 @@ channel = new L2capChannel({
   onData: (bytes) => {
     const r = session.feed(bytes, Number(Bun.nanoseconds()) / 1e9);
     for (const p of r.packets) channel.write(p);
-    if (r.events.some((e) => e.payload.type === "connected")) log("*** CONNECTED: streams enabled ***");
+    for (const e of r.events) {
+      if (e.payload.type === "connected") log("*** CONNECTED: streams enabled ***");
+      else if (e.payload.type === "gesture" && !e.payload.gesture.synthetic) log(`GESTURE ${e.payload.gesture.finger}/${e.payload.gesture.action}/${e.payload.gesture.derivedAction}`);
+      else if (e.payload.type === "dialState") log(`DIAL ${e.payload.engaged ? "engaged" : "released"}`);
+      else if (e.payload.type === "dialTurn") log(`DIAL turn ${e.payload.rotation.toFixed(3)}`);
+    }
     if (!handshakeDone && session.authenticatedPackets > 0) {
       handshakeDone = true;
       if (normal) {
-        setTimeout(() => { log(`== normal watch done. authPkts=${session.authenticatedPackets} streams=${session.streamsEnabled}`); channel.close(); }, 12000);
+        setTimeout(() => { log(`== normal watch done. authPkts=${session.authenticatedPackets} streams=${session.streamsEnabled} motion=${session.motionMessages}`); channel.close(); }, 45000);
       } else {
         setTimeout(() => void experiments(), 1200);
       }
