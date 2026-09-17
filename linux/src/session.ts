@@ -15,6 +15,19 @@ interface HandRequest {
   deadline: number;
 }
 
+export interface SessionOptions {
+  configChannel?: number;
+  phasedLinkSetup?: boolean;
+  /// Never auto-send the subscription; the caller drives follow-ups with encryptFrame (experiments).
+  manualLinkSetup?: boolean;
+  /// Add EnableEncryption field 7 (phased_link_setup_supported) when defined.
+  enablePhasedSupported?: boolean;
+  /// Add EnableEncryption field 8 (supported_link_setup_services) when defined.
+  enableServices?: bigint;
+  /// Include the empty device-info query in phase two (default true).
+  sendDeviceInfo?: boolean;
+}
+
 const FINGERS = ["unknown", "thumb", "index", "middle", "notApplicable"];
 const ACTIONS = ["unknown", "press", "release", "tap", "doubletap", "click", "up", "down", "left", "right", "wake",
   "swipeIn", "swipeOut", "ia", "partialPress", "partialRelease", "partialClick", "partialUp", "partialDown",
@@ -53,15 +66,29 @@ export class BandSession {
   private readonly streamChannel = 0x8005;
   private readonly configurationChannel: number;
   private readonly phasedLinkSetup: boolean;
+  private readonly manualLinkSetup: boolean;
+  private readonly enablePhasedSupported: boolean | undefined;
+  private readonly enableServices: bigint | undefined;
+  private readonly sendDeviceInfo: boolean;
   private phaseTwoSent = false;
   private configurationID = 0n;
   private handRequest: HandRequest | undefined;
   hand: BandHand | undefined;
 
-  constructor(options: { configChannel?: number; phasedLinkSetup?: boolean } = {}) {
+  constructor(options: SessionOptions = {}) {
     this.ecdh.generateKeys();
     this.configurationChannel = options.configChannel ?? 0x8006;
     this.phasedLinkSetup = options.phasedLinkSetup ?? false;
+    this.manualLinkSetup = options.manualLinkSetup ?? false;
+    this.enablePhasedSupported = options.enablePhasedSupported;
+    this.enableServices = options.enableServices;
+    this.sendDeviceInfo = options.sendDeviceInfo ?? true;
+  }
+
+  /// Experimental: encrypt an arbitrary DataX frame with the live cipher (keeps IV/counter in sync).
+  /// Used by scripts/probe.ts to hand-drive link-setup follow-ups. Not used by the app.
+  encryptFrame(frame: Uint8Array): Uint8Array {
+    return this.encrypt(frame);
   }
 
   private get publicKey(): Uint8Array {
@@ -100,9 +127,13 @@ export class BandSession {
           }
           this.peerKey = point;
           this.peerChallenge = fields.bytes(2, 16);
+          // Optional link-setup negotiation fields, off by default (the app never sends them).
+          const extras = concat(
+            this.enablePhasedSupported === undefined ? new Uint8Array() : BandWire.field(7, this.enablePhasedSupported ? 1 : 0),
+            this.enableServices === undefined ? new Uint8Array() : BandWire.field(8, this.enableServices));
           outgoing.push(BandWire.frame(1, [0x02000002], concat(
             BandWire.field(1, this.publicKey), BandWire.field(2, this.seed), BandWire.field(3, this.iv),
-            BandWire.field(4, this.base), BandWire.field(5, 3))));
+            BandWire.field(4, this.base), BandWire.field(5, 3), extras)));
           break;
         }
         case 0x02000002: {
@@ -124,7 +155,8 @@ export class BandSession {
             BandWire.field(1, 1), BandWire.field(2, new Uint8Array(randomBytes(16)))))));
           // Pipelined (older firmware): subscribe in the same batch. Phased (newer firmware):
           // wait for the band's link-setup reply on channel 1 before the 0xce56 requests.
-          if (!this.phasedLinkSetup) this.sendPhaseTwo(outgoing, time);
+          // Manual: never auto-subscribe (an experiment harness drives the follow-ups).
+          if (!this.phasedLinkSetup && !this.manualLinkSetup) this.sendPhaseTwo(outgoing, time);
           break;
         }
         default:
@@ -243,8 +275,10 @@ export class BandSession {
   private sendPhaseTwo(outgoing: Uint8Array[], time: number): void {
     if (this.phaseTwoSent) return;
     this.phaseTwoSent = true;
-    outgoing.push(this.encrypt(BandWire.frame(0x8003, [0x8100ce56, 0x02000314], concat(
-      BandWire.field(1, 1), BandWire.field(3, new Uint8Array())))));
+    if (this.sendDeviceInfo) {
+      outgoing.push(this.encrypt(BandWire.frame(0x8003, [0x8100ce56, 0x02000314], concat(
+        BandWire.field(1, 1), BandWire.field(3, new Uint8Array())))));
+    }
     outgoing.push(this.streamRequest(2n, undefined));
     outgoing.push(this.streamRequest(3n, true));
     outgoing.push(this.requestHand(undefined, true, time));

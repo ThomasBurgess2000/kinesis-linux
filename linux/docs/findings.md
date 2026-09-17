@@ -79,3 +79,33 @@ same frames inline during a normal session.
 - The `EnableEncryption` message has optional fields `7 phased_link_setup_supported` and
   `8 supported_link_setup_services` that we do not currently send; declaring them may change the
   band's link-setup expectations. Worth trying next.
+
+## Live experiment results (follow-ups do not clear 0xc001)
+
+Ran `scripts/experiment.ts` against the band on a live connection (manual link setup, then
+scripted follow-ups on the encrypted channel):
+
+- Echoing the band's `0x01000000` message on channel 1 draws no reply and does not unlock anything.
+- A second EndLinkSetup returns `0x0300c001` (the first one, during handshake, is acked normally).
+- A `0x02000003` link-setup-config message returns `0x0300c001`.
+- Subscribing on a fresh RPC channel (`0x8009`) returns `0x0300c001`, same as `0x8005`.
+
+So no post-handshake message clears the gate; once the first EndLinkSetup is acked the band
+refuses further link-setup control. The decision is made during encryption/link-setup negotiation,
+not afterward.
+
+The optional EnableEncryption fields 7 (`phased_link_setup_supported`) and 8
+(`supported_link_setup_services`) are probably not the differentiator: the POC's phone-to-band
+capture shows the phone does **not** send them, yet the phone reaches the input service. That
+points at owner/authorization state rather than a missing negotiation field. The leading
+hypothesis is now that this band still has the Meta AI app registered as its owner, and newer
+firmware gates the input service on owner authorization until the band is unpaired from that app.
+
+## BlueZ connection notes for this firmware
+
+- The band's connectable window after a button press is short. Reliable path: scan until it
+  advertises (RSSI present), `StopDiscovery`, wait for `Discovering=false`, then `Connect`.
+  Connecting while discovery is active gives `le-connection-abort-by-local`.
+- Bonding hurt reconnection here: once bonded, `Connect` to the identity address timed out while
+  the band advertised a fresh resolvable-private address. Removing the bond and connecting fresh
+  worked. The app should probably not pair unless the PSM read demands it.

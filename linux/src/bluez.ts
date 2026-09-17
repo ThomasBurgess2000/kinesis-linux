@@ -104,6 +104,12 @@ export async function scan(seconds: number, onProgress?: (found: BandDevice[]) =
   return [...found.values()].sort((a, b) => (b.rssi ?? -127) - (a.rssi ?? -127));
 }
 
+export async function isDiscovering(): Promise<boolean> {
+  const adapter = await adapterPath();
+  const props = (await objects()).get(adapter)?.get("org.bluez.Adapter1");
+  return props ? getBoolean(props, "Discovering") === true : false;
+}
+
 export async function stopDiscovery(): Promise<void> {
   const adapter = await adapterPath();
   const props = (await objects()).get(adapter)?.get("org.bluez.Adapter1");
