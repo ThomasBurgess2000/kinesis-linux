@@ -98,8 +98,26 @@ The optional EnableEncryption fields 7 (`phased_link_setup_supported`) and 8
 (`supported_link_setup_services`) are probably not the differentiator: the POC's phone-to-band
 capture shows the phone does **not** send them, yet the phone reaches the input service. That
 points at owner/authorization state rather than a missing negotiation field. The leading
-hypothesis is now that this band still has the Meta AI app registered as its owner, and newer
-firmware gates the input service on owner authorization until the band is unpaired from that app.
+hypothesis was that the band still had the Meta AI app registered as its owner.
+
+## RESOLVED: it was owner state, not firmware
+
+Confirmed on hardware. Unpairing the band in the Meta AI app while the band is **disconnected**
+removes the app's record but does not tell the band, so the band keeps its owner state and gates
+the input service at `0xc001`. Re-adding the band in the app, letting it connect, and removing it
+**while connected** pushes the deregistration to the band. After that, a fresh AirShield session
+from Linux is accepted in full:
+
+- device-info returns firmware `297b870dc9be+` from "Meta Platforms, Inc." (the same firmware the
+  POC tested, so this was never a newer-firmware wall),
+- both subscription requests are acknowledged with flags 3/6/8 enabled,
+- the hand read returns right, and the session reports Connected / streams enabled.
+
+So the port works end to end. The `0xc001` was purely owner authorization; the fix is the
+"unpair from the Meta app first" step done **with the band connected** so it actually registers.
+
+Gestures and motion only stream while the band is **worn** (the sensors need skin contact); an
+idle band on a desk sends only subscription-status frames and then drops the stream.
 
 ## BlueZ connection notes for this firmware
 

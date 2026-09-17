@@ -104,6 +104,26 @@ export async function scan(seconds: number, onProgress?: (found: BandDevice[]) =
   return [...found.values()].sort((a, b) => (b.rssi ?? -127) - (a.rssi ?? -127));
 }
 
+/// Scan until the band advertises, then leave discovery stopped and settled so the following
+/// Connect is not aborted. Matches the saved identity address first, else any advertising Meta
+/// Band (a re-synced band may advertise an address that does not resolve to the saved identity).
+export async function discoverBand(saved: BandDevice, seconds: number): Promise<{ path: string; device: BandDevice } | undefined> {
+  const adapter = await adapterPath();
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    const seen = await scan(4).catch(() => [] as BandDevice[]);
+    const advertising = seen.find((d) => d.address.toUpperCase() === saved.address.toUpperCase() && d.rssi !== undefined)
+      ?? seen.find((d) => d.rssi !== undefined);
+    if (advertising) {
+      await stopDiscovery().catch(() => {});
+      for (let i = 0; i < 20 && (await isDiscovering().catch(() => false)); i++) await Bun.sleep(250);
+      await Bun.sleep(500);
+      return { path: devicePath(adapter, advertising.address), device: advertising };
+    }
+  }
+  return undefined;
+}
+
 export async function isDiscovering(): Promise<boolean> {
   const adapter = await adapterPath();
   const props = (await objects()).get(adapter)?.get("org.bluez.Adapter1");
@@ -121,6 +141,11 @@ export async function stopDiscovery(): Promise<void> {
 export async function knownDevice(address: string): Promise<BandDevice | undefined> {
   const adapter = await adapterPath();
   const props = (await objects()).get(devicePath(adapter, address))?.get("org.bluez.Device1");
+  return props ? deviceFrom(props) : undefined;
+}
+
+export async function deviceByPath(path: string): Promise<BandDevice | undefined> {
+  const props = (await objects()).get(path)?.get("org.bluez.Device1");
   return props ? deviceFrom(props) : undefined;
 }
 

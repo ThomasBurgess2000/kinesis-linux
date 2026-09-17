@@ -18,41 +18,47 @@ const config = await loadConfig();
 const band = config.band;
 if (!band) { console.error("No band saved. Run `kinesis scan` first."); process.exit(1); }
 
-const opts: SessionOptions = { manualLinkSetup: true, configChannel: config.configChannel };
+// NORMAL=1 runs the real pipelined subscription and just watches for streams enabling.
+const normal = process.env.NORMAL === "1";
+const opts: SessionOptions = { manualLinkSetup: !normal, configChannel: config.configChannel };
 if (process.env.CONFIGCH) opts.configChannel = parseInt(process.env.CONFIGCH, 16);
 if (process.env.ENABLE7) opts.enablePhasedSupported = process.env.ENABLE7 === "1";
 if (process.env.ENABLE8 !== undefined) opts.enableServices = BigInt(process.env.ENABLE8);
 log(`opts ${JSON.stringify({ ...opts, enableServices: opts.enableServices?.toString() })}`);
 
-// This firmware's connectable window is short and bonding interferes with reconnect.
-// Drop any stored bond, then scan the band fresh and connect in the same window.
-if (process.env.KEEP_BOND !== "1") await bluez.removeDevice(band.address).catch(() => {});
+// This firmware's connectable window is short. Scan until any Meta Band advertises (after a
+// re-sync its address may not resolve to the saved identity), then connect in the same window.
+if (process.env.KEEP_BOND === "1") { /* keep any existing bond */ }
 let devicePath = "";
+let deviceAddr = band.address;
+let deviceType: "public" | "random" = band.addressType;
+const attempts = Number(process.env.ATTEMPTS ?? 20);
 async function connectFresh(): Promise<void> {
-  for (let attempt = 1; attempt <= 12; attempt++) {
-    log(`refreshing (attempt ${attempt})…`);
-    const seen = await bluez.scan(6).catch(() => []);
-    const advertising = seen.find((d) => d.address.toUpperCase() === band!.address.toUpperCase() && d.rssi !== undefined);
-    if (!advertising) { log(`  not advertising yet`); continue; }
-    const found = await bluez.findDevice(band!);
-    if (!found) { log(`  advertising but no object path yet`); continue; }
-    devicePath = found.path;
-    log(`  advertising at rssi ${advertising.rssi}; settling discovery`);
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    log(`refreshing (attempt ${attempt}/${attempts})…`);
+    const seen = await bluez.scan(5).catch(() => []);
+    const advertising = seen.find((d) => d.address.toUpperCase() === band!.address.toUpperCase() && d.rssi !== undefined)
+      ?? seen.find((d) => d.rssi !== undefined); // any advertising Meta Band
+    if (!advertising) { log(`  no Meta Band advertising yet`); continue; }
+    deviceAddr = advertising.address;
+    deviceType = advertising.addressType;
+    const adapter = await bluez.adapterPath();
+    devicePath = bluez.devicePath(adapter, advertising.address);
+    log(`  advertising: ${advertising.name} ${advertising.address} (${advertising.addressType}) rssi ${advertising.rssi}; settling`);
     await bluez.stopDiscovery().catch(() => {});
     for (let i = 0; i < 20 && (await bluez.isDiscovering().catch(() => false)); i++) await Bun.sleep(250);
     await Bun.sleep(500);
-    try { await bluez.connect(found.path, 20); return; }
+    try { await bluez.connect(devicePath, 20); return; }
     catch (e) {
       log(`  connect failed: ${e instanceof Error ? e.message : String(e)}`);
-      await bluez.disconnect(found.path).catch(() => {});
+      await bluez.disconnect(devicePath).catch(() => {});
     }
   }
-  throw new Error("could not connect after 12 refresh attempts");
+  throw new Error(`could not connect after ${attempts} refresh attempts`);
 }
 await connectFresh();
-const found0 = { path: devicePath, device: (await bluez.findDevice(band))!.device };
-const resolved = (await bluez.findDevice(band))?.device ?? found0.device;
-const psmVal = await bluez.readCharacteristic((await bluez.characteristicPath(found0.path, bluez.PSM_CHARACTERISTIC))!);
+const resolved = { address: deviceAddr, addressType: deviceType, name: band.name };
+const psmVal = await bluez.readCharacteristic((await bluez.characteristicPath(devicePath, bluez.PSM_CHARACTERISTIC))!);
 const psm = psmVal[0]! | (psmVal[1]! << 8);
 log(`connected ${resolved.address} psm=${psm}`);
 
@@ -104,9 +110,14 @@ channel = new L2capChannel({
   onData: (bytes) => {
     const r = session.feed(bytes, Number(Bun.nanoseconds()) / 1e9);
     for (const p of r.packets) channel.write(p);
+    if (r.events.some((e) => e.payload.type === "connected")) log("*** CONNECTED: streams enabled ***");
     if (!handshakeDone && session.authenticatedPackets > 0) {
       handshakeDone = true;
-      setTimeout(() => void experiments(), 1200);
+      if (normal) {
+        setTimeout(() => { log(`== normal watch done. authPkts=${session.authenticatedPackets} streams=${session.streamsEnabled}`); channel.close(); }, 12000);
+      } else {
+        setTimeout(() => void experiments(), 1200);
+      }
     }
   },
   onClose: (reason) => { log(`closed: ${reason ?? "ok"}`); process.exit(0); },

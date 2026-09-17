@@ -139,14 +139,12 @@ export class BandConnection {
     this.emit({ payload: { type: "preparing" }, receivedAt: now() });
     // A leftover discovery or half-open link causes le-connection-abort-by-local; clear both first.
     await bluez.stopDiscovery().catch(() => {});
-    const found = await bluez.findDevice(band);
-    if (!found) throw new KinesisError("BlueZ doesn't know this band yet. Put it in pairing mode and run `kinesis scan`.");
+    // The band's connectable window after a button press is short, and its advertising address
+    // may not resolve to the saved identity until bonded. Scan until it advertises, then connect.
+    const found = await bluez.discoverBand(band, 25);
+    if (!found) throw new KinesisError("The band isn't advertising. Put it in pairing mode (press its button) and try again.");
     const { path: device } = found;
     this.device = device;
-    if ((await bluez.deviceState(device).catch(() => undefined))?.connected) {
-      await bluez.disconnect(device);
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-    }
     if (this.disconnecting) return;
     this.log.info(`Connecting to ${found.device.name || band.name} (${found.device.address}, ${found.device.addressType})`);
     await bluez.connect(device);
@@ -159,8 +157,9 @@ export class BandConnection {
     }
     const psm = await this.readPsm(device);
     if (this.disconnecting) return;
-    // Pairing during service discovery can reveal the band's identity address; use what BlueZ has now.
-    const resolved = (await bluez.findDevice(band))?.device ?? found.device;
+    // After connecting, BlueZ exposes the address it actually connected to on this path; the L2CAP
+    // socket must use that same address and type, not the (possibly rotated) advertised one.
+    const resolved = (await bluez.deviceByPath(device)) ?? found.device;
     this.emit({ payload: { type: "devices", devices: [resolved] }, receivedAt: now() });
     this.log.info(`Opening L2CAP channel on PSM ${psm} to ${resolved.address} (${resolved.addressType})`);
     this.nextBatteryRead = now();
