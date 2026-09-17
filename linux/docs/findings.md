@@ -160,3 +160,32 @@ index double tap -> play/pause, swipe left -> previous desktop, swipe right -> n
 Remaining issue: the stream stopped after ~9 s of input and the band would not accept a reconnect
 afterward, so the open window is short and the band re-locks. Keeping the session alive across
 that is the next problem; the port itself is proven.
+
+## Session length: band resets an unauthenticated peer at ~33-40 s (2026-09-17)
+
+With the recipe working (press button -> connect; no phone step needed after the band has been
+activated once), streaming is solid but time-limited. Across three clean runs with the band worn
+and continuously active:
+
+| run | stream duration | gestures | gyro samples |
+| --- | --- | --- | --- |
+| 1 | ~28 s | 5 | ~560 |
+| 2 | ~38 s | 19 | 4521 |
+| 3 | ~33 s | 59 | 4089 |
+
+Data flows the whole time at ~256 DataX frames/s (~70 SDU/s) with the reader keeping up (largest
+single read < 1 KB, no backlog), then the band ends it. The disconnect reason is
+`ECONNRESET (errno 104)` — the band actively resets the L2CAP link.
+
+Not fixable from our side, tested:
+- A 4 MB socket receive buffer: reads were never behind, so credit starvation was not the cause.
+- A keepalive status query every 10 s during streaming: the band ignored the queries (no reply)
+  and still reset on schedule. So it is not a receive-watchdog we can feed.
+
+This is almost certainly the unauthenticated-session grace period: the band grants a short window
+to a peer that has not completed owner authentication, then resets. The companion app presumably
+re-authenticates to hold the session open; that step is the same one the upstream POC left
+unsolved. The POC's own captures were similarly short (tens of seconds).
+
+Practical state: gestures and the wrist dial work and map correctly; sessions last ~30-40 s and
+then need a button press to renew. Continuous operation would require the owner-auth handshake.

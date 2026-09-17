@@ -295,6 +295,13 @@ export class BandConnection {
     const session = this.session;
     if (!this.stopping && session) {
       for (const event of session.tick(time)) this.emit(event);
+      // Optional keepalive: some firmware drops the link after ~35 s of one-way streaming. A
+      // periodic status query while data still flows tests whether the band wants to hear from us.
+      const keepalive = Number(process.env.KINESIS_KEEPALIVE ?? 0);
+      if (keepalive > 0 && session.streamsEnabled && time - this.lastStatusQuery >= keepalive) {
+        try { const q = session.queryStreamState(); this.lastStatusQuery = time; if (q.length) { this.log.info("keepalive status query"); this.channel?.write(q); } }
+        catch (error) { this.fail(error); }
+      }
       if (session.streamsEnabled && time - this.lastReadAt >= 2 && time - this.lastStatusQuery >= 2) {
         try {
           const query = session.queryStreamState();

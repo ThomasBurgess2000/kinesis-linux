@@ -73,7 +73,9 @@ self.onmessage = (event: MessageEvent<WorkerCommand>) => {
       const copy = buffer.slice(0, count);
       post({ type: "data", bytes: copy.buffer }, [copy.buffer]);
     } else if (socketEvents & (POLLHUP | POLLERR)) {
-      reason = "The band input stream failed";
+      const err = new Int32Array(1); const elen = new Uint32Array([4]);
+      libc.symbols.getsockopt(fd, 1 /* SOL_SOCKET */, 4 /* SO_ERROR */, ptr(err), ptr(elen));
+      reason = `The band input stream failed (socket error ${err[0]}: ${errnoMessage(err[0]!)})`;
       break;
     }
   }
