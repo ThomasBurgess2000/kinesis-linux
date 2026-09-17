@@ -87,6 +87,7 @@ export interface L2capOptions {
   psm: number;
   security: SecurityLevel;
   receiveMtu?: number;
+  connectTimeoutMs?: number;
   log?: (message: string) => void;
 }
 
@@ -100,7 +101,7 @@ export function socketMtu(fd: number, option: number): number {
 /// Creates, configures, and connects the socket. Runs inside the worker. The connect is
 /// non-blocking so a byte on `wakeFd` can abort it; the kernel's own LE connect timeout
 /// otherwise decides how long an unreachable band takes to fail.
-export function openL2cap(options: L2capOptions, wakeFd?: number, timeoutMs = 40_000): number {
+export function openL2cap(options: L2capOptions, wakeFd?: number, timeoutMs = options.connectTimeoutMs ?? 40_000): number {
   const fd = libc.symbols.socket(AF_BLUETOOTH, SOCK_SEQPACKET | SOCK_CLOEXEC, BTPROTO_L2CAP);
   if (fd < 0) throw new Error(`Could not create an L2CAP socket: ${errnoMessage()}`);
   try {

@@ -21,6 +21,8 @@ export interface Config {
   linkSetup: "pipelined" | "phased";
   configChannel: number;
   bond: boolean;
+  directL2cap: boolean;
+  psm: number;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -32,7 +34,9 @@ export const DEFAULT_CONFIG: Config = {
   security: "low",
   linkSetup: "pipelined",
   configChannel: 0x8006,
-  bond: true,
+  bond: false,
+  directL2cap: true,
+  psm: 255,
 };
 
 export function configPath(): string {
@@ -80,6 +84,8 @@ export function normalize(raw: unknown): Config {
     config.configChannel = raw.configChannel;
   }
   if (typeof raw.bond === "boolean") config.bond = raw.bond;
+  if (typeof raw.directL2cap === "boolean") config.directL2cap = raw.directL2cap;
+  if (typeof raw.psm === "number" && Number.isInteger(raw.psm) && raw.psm > 0 && raw.psm <= 0xffff) config.psm = raw.psm;
   return config;
 }
 

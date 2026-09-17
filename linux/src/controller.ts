@@ -87,7 +87,7 @@ export class Controller {
     this.enableWhenLive = options.enableControls;
     this.retries = 0;
     this.ticker ??= setInterval(() => this.tick(), 500);
-    this.run({ kind: "connect", band, security: this.config.security, session: this.sessionOptions, bond: this.config.bond });
+    this.run({ kind: "connect", band, security: this.config.security, session: this.sessionOptions, bond: this.config.bond, directL2cap: this.config.directL2cap, psm: this.config.psm });
   }
 
   async disconnect(): Promise<void> {
@@ -322,12 +322,14 @@ export class Controller {
   private scheduleReconnect(): void {
     if (this.retry) clearTimeout(this.retry);
     this.retries += 1;
-    const delay = Math.min(2 * this.retries, 10);
+    // Retry quickly: the band advertises continuously, and we want to catch its brief connectable
+    // window right after a button press rather than backing off away from it.
+    const delay = Math.min(this.retries, 2);
     this.setPhase(`Reconnecting in ${delay}s…`);
     this.retry = setTimeout(() => {
       this.retry = undefined;
       if (!this.wantsConnection || this.quitting || !this.band) return;
-      this.run({ kind: "connect", band: this.band, security: this.config.security, session: this.sessionOptions, bond: this.config.bond });
+      this.run({ kind: "connect", band: this.band, security: this.config.security, session: this.sessionOptions, bond: this.config.bond, directL2cap: this.config.directL2cap, psm: this.config.psm });
     }, delay * 1000);
   }
 

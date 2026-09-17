@@ -74,17 +74,30 @@ export function isBandName(name: string): boolean {
   return name.toLowerCase().startsWith("meta band");
 }
 
+// BlueZ ties a discovery session to the D-Bus client that started it. `busctl call StartDiscovery`
+// exits as soon as the reply arrives, so BlueZ drops that session at once and nothing is scanned.
+// Hold the session with a long-lived bluetoothctl process for as long as we need to discover.
+let discoverySession: ReturnType<typeof Bun.spawn> | undefined;
+
+export function holdDiscovery(maxSeconds = 600): void {
+  if (discoverySession && discoverySession.exitCode === null) return;
+  discoverySession = Bun.spawn(["bluetoothctl", "--timeout", String(maxSeconds), "scan", "on"], {
+    stdin: "ignore", stdout: "ignore", stderr: "ignore",
+  });
+}
+
+export async function releaseDiscovery(): Promise<void> {
+  const proc = discoverySession;
+  discoverySession = undefined;
+  if (!proc || proc.exitCode !== null) return;
+  proc.kill();
+  await proc.exited.catch(() => {});
+}
+
 /// Scan for advertising bands. Already-known bands are listed even if quiet, without an RSSI.
 export async function scan(seconds: number, onProgress?: (found: BandDevice[]) => void): Promise<BandDevice[]> {
   const adapter = await adapterPath();
-  await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "SetDiscoveryFilter", "a{sv}", "1", "Transport", "s", "le"]).catch(() => {});
-  let started = false;
-  try {
-    await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "StartDiscovery"]);
-    started = true;
-  } catch (error) {
-    if (!(error instanceof BluezError && /InProgress/.test(error.message))) throw error;
-  }
+  holdDiscovery(seconds + 5);
   const found = new Map<string, BandDevice>();
   const deadline = Date.now() + seconds * 1000;
   try {
@@ -99,7 +112,7 @@ export async function scan(seconds: number, onProgress?: (found: BandDevice[]) =
       await Bun.sleep(1000);
     }
   } finally {
-    if (started) await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "StopDiscovery"]).catch(() => {});
+    await releaseDiscovery();
   }
   return [...found.values()].sort((a, b) => (b.rssi ?? -127) - (a.rssi ?? -127));
 }
@@ -110,33 +123,40 @@ export async function scan(seconds: number, onProgress?: (found: BandDevice[]) =
 export async function discoverBand(saved: BandDevice, seconds: number): Promise<{ path: string; device: BandDevice } | undefined> {
   const adapter = await adapterPath();
   const deadline = Date.now() + seconds * 1000;
-  while (Date.now() < deadline) {
-    let started = false;
-    try {
-      await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "StartDiscovery"]);
-      started = true;
-    } catch { /* someone else is discovering; still enumerate */ }
-    await Bun.sleep(4000);
-    // Use the real object path from BlueZ, not one reconstructed from the address: a resolved
-    // identity address can report at a different path than dev_<ADDR>, and connecting to the
-    // reconstructed path hits a phantom object ("Method Connect ... doesn't exist").
-    const candidates: { path: string; device: BandDevice }[] = [];
-    for (const [path, ifaces] of await objects()) {
-      if (!path.startsWith(adapter + "/dev_")) continue;
-      const props = ifaces.get("org.bluez.Device1");
-      const device = props && deviceFrom(props);
-      if (device && isBandName(device.name) && device.rssi !== undefined) candidates.push({ path, device });
+  // Remove every cached Meta Band object first. Each button press makes the band advertise a new
+  // resolvable-private address, and BlueZ keeps the old objects with a stale RSSI; picking one of
+  // those connects to an address the band no longer uses and times out. After removal, only the
+  // address the band is advertising *right now* reappears.
+  for (const [path, ifaces] of await objects()) {
+    if (!path.startsWith(adapter + "/dev_")) continue;
+    const device = ifaces.get("org.bluez.Device1") && deviceFrom(ifaces.get("org.bluez.Device1")!);
+    if (device && isBandName(device.name)) {
+      await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "RemoveDevice", "o", path], 10).catch(() => {});
     }
-    const chosen = candidates.find((c) => c.device.address.toUpperCase() === saved.address.toUpperCase()) ?? candidates[0];
-    if (chosen) {
-      await stopDiscovery().catch(() => {});
-      for (let i = 0; i < 20 && (await isDiscovering().catch(() => false)); i++) await Bun.sleep(250);
-      await Bun.sleep(500);
-      return chosen;
-    }
-    if (!started) await Bun.sleep(1000);
   }
-  await stopDiscovery().catch(() => {});
+  holdDiscovery(seconds + 5);
+  try {
+    while (Date.now() < deadline) {
+      // Poll fast so we connect the instant the band appears: its connectable window after a
+      // button press is only a few seconds, so any settle delay here means we miss it.
+      await Bun.sleep(600);
+      const candidates: { path: string; device: BandDevice }[] = [];
+      for (const [path, ifaces] of await objects()) {
+        if (!path.startsWith(adapter + "/dev_")) continue;
+        const props = ifaces.get("org.bluez.Device1");
+        const device = props && deviceFrom(props);
+        if (device && isBandName(device.name) && device.rssi !== undefined) candidates.push({ path, device });
+      }
+      // Freshly re-discovered after the purge above, so the strongest signal is the live one.
+      const chosen = candidates.sort((a, b) => (b.device.rssi ?? -127) - (a.device.rssi ?? -127))[0];
+      if (chosen) {
+        await releaseDiscovery();
+        return chosen;
+      }
+    }
+  } finally {
+    await releaseDiscovery();
+  }
   return undefined;
 }
 
@@ -146,12 +166,9 @@ export async function isDiscovering(): Promise<boolean> {
   return props ? getBoolean(props, "Discovering") === true : false;
 }
 
+/// Ends our own discovery session. Sessions held by other clients are left alone.
 export async function stopDiscovery(): Promise<void> {
-  const adapter = await adapterPath();
-  const props = (await objects()).get(adapter)?.get("org.bluez.Adapter1");
-  if (props && getBoolean(props, "Discovering") === true) {
-    await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "StopDiscovery"], 10).catch(() => {});
-  }
+  await releaseDiscovery();
 }
 
 export async function knownDevice(address: string): Promise<BandDevice | undefined> {
@@ -223,9 +240,9 @@ export async function deviceState(path: string): Promise<DeviceState> {
 }
 
 /// Connect the LE link through BlueZ so GATT is available and the L2CAP socket can share the ACL.
-export async function connect(path: string, timeoutSeconds = 60): Promise<void> {
+export async function connect(path: string, timeoutSeconds = 18): Promise<void> {
   await busctl(["call", "org.bluez", path, "org.bluez.Device1", "Connect"], timeoutSeconds);
-  const deadline = Date.now() + 45_000;
+  const deadline = Date.now() + Math.max(8000, timeoutSeconds * 1000);
   while (Date.now() < deadline) {
     if ((await property(path, "org.bluez.Device1", "ServicesResolved")) === true) return;
     await Bun.sleep(250);

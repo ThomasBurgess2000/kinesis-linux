@@ -20,7 +20,7 @@ export class KinesisError extends Error {
 export interface SessionOptions { configChannel?: number; phasedLinkSetup?: boolean }
 export type BandOperation =
   | { kind: "scan"; seconds: number }
-  | { kind: "connect"; band: BandDevice; security: SecurityLevel; session?: SessionOptions; bond?: boolean };
+  | { kind: "connect"; band: BandDevice; security: SecurityLevel; session?: SessionOptions; bond?: boolean; directL2cap?: boolean; psm?: number };
 
 export interface Logger {
   info(message: string): void;
@@ -97,7 +97,7 @@ export class BandConnection {
     if (operation.kind === "scan") {
       this.scan(operation.seconds).catch((error: unknown) => this.fail(error));
     } else {
-      this.connect(operation.band, operation.security, operation.session ?? {}, operation.bond ?? true).catch((error: unknown) => this.fail(error));
+      this.connect(operation.band, operation).catch((error: unknown) => this.fail(error));
     }
   }
 
@@ -135,51 +135,54 @@ export class BandConnection {
     this.disconnect();
   }
 
-  private async connect(band: BandDevice, security: SecurityLevel, session: SessionOptions, bond: boolean): Promise<void> {
+  private async connect(band: BandDevice, options: { security: SecurityLevel; session?: SessionOptions; bond?: boolean; directL2cap?: boolean; psm?: number }): Promise<void> {
+    const security = options.security;
+    const session = options.session ?? {};
+    const directL2cap = options.directL2cap ?? true;
     this.emit({ payload: { type: "preparing" }, receivedAt: now() });
-    // A leftover discovery or half-open link causes le-connection-abort-by-local; clear both first.
     await bluez.stopDiscovery().catch(() => {});
-    // The band's connectable window after a button press is short, and its advertising address
-    // may not resolve to the saved identity until bonded. Scan until it advertises, then connect.
-    const found = await bluez.discoverBand(band, Number(process.env.KINESIS_DISCOVER ?? 60));
-    if (!found) throw new KinesisError("The band isn't advertising. Put it in pairing mode (press its button) and try again.");
+    // If the band is already connected, use that link; otherwise scan until it advertises.
+    const existing = await bluez.connectedBand().catch(() => undefined);
+    const found = existing ?? await bluez.discoverBand(band, Number(process.env.KINESIS_DISCOVER ?? 60));
+    if (!found) throw new KinesisError("The band isn't connected or advertising. Put it in pairing mode (press its button) and try again.");
     let device = found.path;
     this.device = device;
     if (this.disconnecting) return;
-    this.log.info(`Connecting to ${found.device.name || band.name} (${found.device.address}, ${found.device.addressType})`);
-    await bluez.connect(device);
+
+    // Direct L2CAP: skip BlueZ's Device1.Connect (which times out on this band while it is in
+    // pairing mode) and open the connection-oriented channel straight to the advertised address.
+    // The kernel establishes the ACL. The PSM is a constant on this firmware, so no GATT read.
+    if (directL2cap && !existing) {
+      const psm = options.psm ?? 255;
+      // Fail fast: the band accepts a connection only briefly after a button press, so a short
+      // L2CAP connect timeout lets us retry into the next window instead of hanging ~30 s.
+      this.deadline = now() + 14;
+      this.nextBatteryRead = Infinity; // no GATT session for battery in this mode
+      this.log.info(`Opening L2CAP channel on PSM ${psm} to ${found.device.address} (${found.device.addressType})`);
+      this.emit({ payload: { type: "devices", devices: [found.device] }, receivedAt: now() });
+      this.openChannel(session, found.device.address, found.device.addressType, psm, security, 8000);
+      return;
+    }
+
+    this.log.info(`${existing ? "Using existing connection to" : "Connecting to"} ${found.device.name || band.name} (${found.device.address}, ${found.device.addressType})`);
+    this.deadline = now() + 45;
+    await bluez.connect(device, 18);
     if (this.disconnecting) return;
     this.log.info("Band services discovered");
-    // Bond so the band remembers this host and future connects don't need a button press.
-    // Pairing can move the device from the advertised address path to its identity path, so
-    // re-resolve to the connected object afterward and use that path from here on. Best effort.
-    if (bond) {
-      const state = await bluez.deviceState(device).catch(() => undefined);
-      if (state && !state.bonded) {
-        this.log.info("Bonding with the band");
-        try {
-          await bluez.pair(device);
-        } catch (e) {
-          this.log.info(`Bonding skipped: ${e instanceof Error ? e.message : String(e)}`);
-        }
-        const reconnected = await bluez.connectedBand().catch(() => undefined);
-        if (reconnected) { device = reconnected.path; this.device = device; }
-      }
-    }
-    if (this.disconnecting) return;
-    // BlueZ's own connect can take a while; give the L2CAP open and handshake a fresh window.
     this.deadline = now() + 30;
     if (!(await bluez.hasService(device, bluez.BAND_SERVICE))) {
       throw new KinesisError("This device doesn't expose the band input service");
     }
     const psm = await this.readPsm(device);
     if (this.disconnecting) return;
-    // After connecting, BlueZ exposes the address it actually connected to on this path; the L2CAP
-    // socket must use that same address and type, not the (possibly rotated) advertised one.
     const resolved = (await bluez.deviceByPath(device)) ?? found.device;
     this.emit({ payload: { type: "devices", devices: [resolved] }, receivedAt: now() });
     this.log.info(`Opening L2CAP channel on PSM ${psm} to ${resolved.address} (${resolved.addressType})`);
     this.nextBatteryRead = now();
+    this.openChannel(session, resolved.address, resolved.addressType, psm, security);
+  }
+
+  private openChannel(session: SessionOptions, address: string, addressType: "public" | "random", psm: number, security: SecurityLevel, connectTimeoutMs?: number): void {
     const channel = new L2capChannel({
       onOpen: () => { if (this.channel === channel) this.opened(session); },
       onData: (bytes) => { if (this.channel === channel) this.readInput(bytes); },
@@ -187,7 +190,7 @@ export class BandConnection {
       onLog: (message) => this.log.info(message),
     });
     this.channel = channel;
-    channel.open({ address: resolved.address, addressType: resolved.addressType, psm, security });
+    channel.open({ address, addressType, psm, security, ...(connectTimeoutMs !== undefined ? { connectTimeoutMs } : {}) });
   }
 
   private async readPsm(device: string): Promise<number> {
