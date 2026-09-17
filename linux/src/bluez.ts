@@ -271,6 +271,10 @@ export async function removeDevice(address: string): Promise<void> {
   await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "RemoveDevice", "o", devicePath(adapter, address)], 15);
 }
 
+export async function removeDeviceByPath(adapter: string, path: string): Promise<void> {
+  await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "RemoveDevice", "o", path], 15);
+}
+
 export async function characteristicPath(device: string, uuid: string): Promise<string | undefined> {
   for (const [path, ifaces] of await objects()) {
     if (!path.startsWith(device + "/")) continue;

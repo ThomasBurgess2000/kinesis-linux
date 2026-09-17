@@ -189,3 +189,16 @@ unsolved. The POC's own captures were similarly short (tens of seconds).
 
 Practical state: gestures and the wrist dial work and map correctly; sessions last ~30-40 s and
 then need a button press to renew. Continuous operation would require the owner-auth handshake.
+
+## After a reset the band goes silent until a button press (measured 2026-09-17)
+
+`scripts/reconnect-test.ts`: get one streaming session, and the instant the band resets, purge its
+BlueZ object and watch a continuous scan for 120 s with no button press.
+
+Result: session streamed 47 s, then `ECONNRESET`. For the following **120 s the band emitted no
+advertisement at all** (`re-advertised=false`) — BlueZ was scanning the whole time and saw nothing.
+
+Implication: the post-session dormancy is the band, not our connect method. Neither CoreBluetooth
+nor BlueZ can page a device that is not advertising, so no client — the Mac app included — can
+reconnect without a button press. Each button press yields one ~30-50 s session; then the band is
+dark until pressed again. This is hardware behavior in standalone (no glasses/phone) operation.
