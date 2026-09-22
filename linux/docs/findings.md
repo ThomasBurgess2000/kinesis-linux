@@ -224,3 +224,27 @@ Ported modules: `identity.ts` (key + keychain→file storage), `ceremony.ts` (BL
 the staged/enrolled setup state machine are covered by offline tests against a synthetic band.
 This supersedes the earlier "not clearable client-side" conclusion, which was measured before the
 enrollment key was in play.
+
+## Parameter set 26 solved; band enters a relay/multiplexed mode (2026-09-21)
+
+After a factory reset and Meta-app re-sign-in, this band stopped negotiating parameter 3 and now
+offers 27 / negotiates **26** persistently (phone Bluetooth off does not change it). Param 3's key
+derivation fails the packet MAC. Captured one handshake + first record (`scripts/params-probe.ts`)
+and brute-forced the derivation offline (`scripts/params-solve.ts`); the match:
+
+- **param 26 = extended derivation**: enc IKM = raw ECDH secret S, salt = SHA256(challenge‖seed)
+  (the param-31 branch), MAC input prefixed with `02 02 00 00`, MAC key = enc key (the separate
+  hmac_derive branch, bit 2, is not set). Param 3 stays IKM=SHA256(S), salt SHA256(H‖C‖R), no prefix.
+
+`airShieldParams()`/`macPrefixFor()` now select the derivation and MAC format from the negotiated
+parameter bits (extended = bits 3/4; separate MAC = bit 2), and packets authenticate under param 26.
+
+But once decryption works, the band's frames show it is in a **multiplexed relay mode**: it sends an
+`EnableTrustEC` proof (`0x02001001`) on the identity service and a fresh `RequestEncryption`
+(`0x02000001`) on a second service (`0x4f`), over `0x9xxx` channels, then closes the link. That is
+the band↔companion relay/substream protocol — unimplemented here and in the upstream POC. The band
+is in this mode because it is currently owned/associated with the Meta app; param 3 (single,
+non-relay) is the state where our code and the Mac app work.
+
+Practical next step: fully remove the band from the Meta app on the phone (deregister, ideally while
+connected so the band records it) to leave relay mode and return to the single-session param-3 state.

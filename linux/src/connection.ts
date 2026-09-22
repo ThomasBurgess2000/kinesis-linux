@@ -248,7 +248,7 @@ export class BandConnection {
       const wasEnabled = session.streamsEnabled;
       const wasAuthenticated = session.authenticatedPackets > 0;
       const result = session.feed(bytes, time);
-      if (!wasAuthenticated && session.authenticatedPackets > 0) this.log.info("Encrypted packet verified");
+      if (!wasAuthenticated && session.authenticatedPackets > 0) this.log.info(`Encrypted packet verified (band params offered ${session.offeredParams}, negotiated ${session.negotiatedParams})`);
       if (!wasEnabled && session.streamsEnabled) this.log.notice("Band acknowledged gesture and motion subscription");
       // One AirShield record per SDU: the band's framing does not reassemble across writes.
       for (const packet of result.packets) this.channel?.write(packet);
@@ -266,6 +266,7 @@ export class BandConnection {
       }
       if (this.stopping && session.stopAcknowledged) this.disconnect();
     } catch (error) {
+      if (session.negotiatedParams) this.log.notice(`Band params offered ${session.offeredParams}, negotiated ${session.negotiatedParams}`);
       this.fail(error);
     }
   }

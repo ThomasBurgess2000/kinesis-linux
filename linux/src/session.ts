@@ -9,7 +9,7 @@
 //   input     – gesture/gyro/quaternion subscription is live
 
 import { createECDH, createHash, randomBytes } from "node:crypto";
-import { AirShieldCipher, AirShieldKeys, AirShieldReceiver } from "./airshield";
+import { AirShieldCipher, AirShieldKeys, AirShieldReceiver, airShieldParams, macPrefixFor } from "./airshield";
 import { OwnershipCeremony, ceremonyFailureMessage } from "./ceremony";
 import { PinchDial } from "./dial";
 import { type BandEnrollmentIdentity, BandIdentityMismatchError, verifyPreimage } from "./identity";
@@ -66,6 +66,8 @@ export class BandSession {
   authenticatedPackets = 0;
   motionMessages = 0;
   streamsEnabled = false;
+  offeredParams = 0n;
+  negotiatedParams = 0n;
   private readonly streamFields = [3, 6, 8];
   private readonly streamChannel = 0x8005;
   private readonly configurationChannel: number;
@@ -118,9 +120,13 @@ export class BandSession {
       const point = fields.bytes(1, 64);
       switch (kind) {
         case 0x02000001: {
-          if (this.peerKey !== undefined || fields.integer(3) !== 0n || fields.integer(4) !== 3n) {
-            throw new BandProtocolError("Unsupported band encryption parameters");
+          // field 4 is the band's parameter set. We only implement the param-3 key derivation;
+          // whether it matches other advertised values is decided by the packet MAC below, so we
+          // record the value and proceed rather than gating on it. Only the P-256 curve is required.
+          if (this.peerKey !== undefined || fields.integer(3) !== 0n) {
+            throw new BandProtocolError(`Unsupported band encryption curve (${fields.integer(3)})`);
           }
+          this.offeredParams = fields.integer(4);
           this.peerKey = point;
           this.peerChallenge = fields.bytes(2, 16);
           outgoing.push(BandWire.frame(1, [0x02000002], concat(
@@ -130,18 +136,25 @@ export class BandSession {
         }
         case 0x02000002: {
           const peerChallenge = this.peerChallenge;
-          if (!this.peerKey || !peerChallenge || Buffer.compare(point, this.peerKey) !== 0 || fields.integer(5) !== 3n) {
+          // Accept the negotiated parameters (recorded in field 5); the packet MAC validates the
+          // derivation. Only the band key match and the seed/iv shapes are structurally required.
+          if (!this.peerKey || !peerChallenge || Buffer.compare(point, this.peerKey) !== 0) {
             throw new BandProtocolError("Unexpected band encryption response");
           }
+          this.negotiatedParams = fields.integer(5);
           const secret = new Uint8Array(this.ecdh.computeSecret(concat(new Uint8Array([4]), point)));
           const peerSeed = fields.bytes(2, 32);
           this.peerSeed = peerSeed;
           const peerIV = fields.bytes(3, 16);
           const peerBase = fields.integer(4);
           if (peerBase < 0n || peerBase > 0xffffffffn) throw new BandProtocolError("Invalid band packet counter");
-          this.transmitter = new AirShieldCipher(AirShieldKeys.derive(secret, peerChallenge, this.seed), this.iv, this.base);
+          // The negotiated parameters select the key derivation and MAC format (param 3 vs the
+          // extended 26/31 style). TX uses the peer challenge + our seed; RX uses ours + the peer's.
+          const params = airShieldParams(this.negotiatedParams);
+          const macPrefix = macPrefixFor(this.negotiatedParams);
+          this.transmitter = new AirShieldCipher(AirShieldKeys.derive(secret, peerChallenge, this.seed, params), this.iv, this.base, macPrefix);
           this.receiver = new AirShieldReceiver(new AirShieldCipher(
-            AirShieldKeys.derive(secret, this.challenge, peerSeed), peerIV, Number(peerBase)));
+            AirShieldKeys.derive(secret, this.challenge, peerSeed, params), peerIV, Number(peerBase), macPrefix));
           if (this.ceremony) {
             // Enrollment startup runs the ownership ceremony instead of the identity queries.
             this.setupStage = "ceremony";

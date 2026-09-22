@@ -200,49 +200,48 @@ async function enroll(args: string[]): Promise<void> {
     console.log(`This band already has an enrolled identity (${BandIdentity.path(band.address)}). Re-enrolling replaces it.`);
   }
   const session = await obtainMetaSession(values.login);
-  const connection = new BandConnection(log);
+  const pairClient = new MetaPairClient(session);
   console.log("\nPut the band in pairing mode (press its button) and keep it on your wrist.");
 
-  const enrolled = await new Promise<boolean>((resolve, reject) => {
-    const start = (pairClient: MetaPairClient) => {
-      const ceremony = new OwnershipCeremony(band.address);
+  // Transient BLE failures (aborted connects, short-window timeouts) are worth retrying; the band
+  // advertises again after each. A ceremony/HTTP/auth failure is terminal.
+  const isTransient = (message: string): boolean =>
+    /abort-by-local|took too long|isn't connected or advertising|stream failed|stream ended|services never resolved/i.test(message);
+
+  for (let attempt = 1; attempt <= 12; attempt++) {
+    const connection = new BandConnection(log);
+    const ceremony = new OwnershipCeremony(band.address);
+    let identity: import("./identity").BandEnrollmentIdentity | undefined;
+    const outcome = await new Promise<Error | undefined>((resolve) => {
       connection.start(
         { kind: "connect", band, security: config.security, session: { configChannel: config.configChannel, ceremony }, bond: config.bond, directL2cap: config.directL2cap, psm: config.psm, pairClient },
         (event: BandEvent) => {
           if (event.payload.type === "ceremonyStage") console.log(`${stamp()} enrollment: ${event.payload.message}`);
           if (event.payload.type === "connected") {
-            const identity = connection.enrolled;
-            if (identity) {
-              BandIdentity.save(identity, band.address)
-                .then(() => { console.log(`${stamp()} enrolled and streaming. Identity saved to ${BandIdentity.path(band.address)}.`); resolve(true); })
-                .catch(reject);
-            } else {
-              console.log(`${stamp()} connected, but no enrolled identity was produced.`);
-              resolve(false);
-            }
+            identity = connection.enrolled;
             connection.stop();
           }
         },
-        (error) => { if (error) reject(error); },
-      ).catch(reject);
-    };
-    start(new MetaPairClient(session));
-  }).catch(async (error: unknown) => {
-    if (error instanceof MetaSessionInvalidError) {
+        (error) => resolve(error),
+      ).catch((error: unknown) => resolve(error instanceof Error ? error : new Error(String(error))));
+    });
+
+    if (identity) {
+      await BandIdentity.save(identity, band.address);
+      console.log(`\nEnrolled and streaming. Identity saved to ${BandIdentity.path(band.address)}.`);
+      console.log("Done. Run `kinesis run` for a stable, auto-reconnecting session.");
+      return;
+    }
+    if (outcome instanceof MetaSessionInvalidError) {
       await MetaSessionStore.delete();
       fail("Your Meta session expired. Run `kinesis enroll --login` to sign in again.");
     }
-    throw error;
-  });
-  await connection_stopAndWait(connection);
-  if (!enrolled) fail("Enrollment did not complete.");
-  console.log("Done. Run `kinesis run` for a stable, auto-reconnecting session.");
-}
-
-async function connection_stopAndWait(connection: BandConnection): Promise<void> {
-  connection.stop();
-  const deadline = Date.now() + 5000;
-  while (connection.active && Date.now() < deadline) await Bun.sleep(100);
+    const message = outcome?.message ?? "the connection closed before enrollment finished";
+    if (!isTransient(message)) fail(`Enrollment failed: ${message}`);
+    console.log(`${stamp()} ${message}; retrying (${attempt}/12)…`);
+    await Bun.sleep(1500);
+  }
+  fail("Couldn't hold a connection to the band long enough to enroll. Keep it in pairing mode and try again.");
 }
 
 async function hand(args: string[]): Promise<void> {
