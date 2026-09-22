@@ -5,6 +5,7 @@ import { parseArgs } from "node:util";
 import { ALL_ACTIONS, KdeBackend, LoggingBackend, backendFor } from "./actions";
 import * as bluez from "./bluez";
 import { type Config, DEFAULT_CONFIG, configPath, loadConfig, saveConfig } from "./config";
+import { canCaptureCallback, captureCallback, openInBrowser } from "./callback";
 import { OwnershipCeremony } from "./ceremony";
 import { type BandEvent } from "./gestures";
 import { BandConnection, KinesisError, type Logger } from "./connection";
@@ -160,13 +161,25 @@ async function obtainMetaSession(forceLogin: boolean): Promise<MetaSession> {
     if (saved) { console.log("Using saved Meta account session."); return saved; }
   }
   const tokens = await MetaAuth.tokensQuery();
-  console.log("\nOpen this URL in your browser and sign in to your Meta account:\n");
-  console.log("  " + authEntryURL(tokens) + "\n");
-  console.log("After signing in, the page redirects to a URL beginning with `fb-viewapp://frl_login`.");
-  console.log("Your browser can't open that scheme, so copy the full URL (from the address bar or the");
-  console.log("blocked-redirect error) and paste it here.\n");
-  const callback = (prompt("Paste the fb-viewapp:// callback URL:") ?? "").trim();
-  if (!callback) throw new KinesisError("No callback URL provided.");
+  const url = authEntryURL(tokens);
+  let callback: string | undefined;
+  if (canCaptureCallback()) {
+    console.log("\nA browser will open Meta's sign-in page. Sign in there; the callback is captured");
+    console.log("automatically (a temporary handler for the fb-viewapp:// scheme, removed afterward).");
+    console.log("\nIf the browser doesn't open, paste this URL into it manually:\n\n  " + url + "\n");
+    callback = await captureCallback(180_000, async () => {
+      if (!(await openInBrowser(url))) console.log("(couldn't launch a browser automatically — open the URL above)");
+    });
+    if (!callback) console.log("\nDidn't capture the callback automatically.");
+  } else {
+    console.log("\nOpen this URL in your browser and sign in to your Meta account:\n\n  " + url + "\n");
+  }
+  if (!callback) {
+    console.log("After signing in, the page redirects to a URL beginning with `fb-viewapp://frl_login`.");
+    console.log("If you can copy that URL, paste it here; otherwise press enter to cancel.\n");
+    callback = (prompt("Paste the fb-viewapp:// callback URL (or enter to cancel):") ?? "").trim();
+  }
+  if (!callback) throw new KinesisError("No callback captured. Run `kinesis enroll` again.");
   const { token, blob } = MetaAuth.parseCallback(callback);
   if (!blob || !MetaAuth.callbackMatches(token, tokens.nativeSSOToken)) {
     throw new KinesisError("That callback URL didn't match this sign-in. Start `kinesis enroll` again.");
