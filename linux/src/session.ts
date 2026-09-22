@@ -1,10 +1,18 @@
-// The observed band handshake and input subscription. It never exports session keys.
-// Port of Sources/KinesisCore/BandSession.swift. Transport-agnostic: feed() takes
-// bytes from the L2CAP link and returns bytes to write back plus decoded events.
+// The observed band handshake, enrollment ceremony, per-session trust proof, and input
+// subscription. Port of Sources/KinesisCore/BandSession.swift. It never exports session keys.
+//
+// Setup runs a small state machine:
+//   link      – plain handshake, then EndLinkSetup (un-enrolled bands)
+//   ceremony  – owner-enrollment ceremony (pairs the band to a Meta account)
+//   identity  – enrolled EnableTrust proof; waits for mutual trust, then EndLinkSetup
+//   deviceInfo– device-info RPC that gates the input service
+//   input     – gesture/gyro/quaternion subscription is live
 
-import { createECDH, randomBytes } from "node:crypto";
+import { createECDH, createHash, randomBytes } from "node:crypto";
 import { AirShieldCipher, AirShieldKeys, AirShieldReceiver } from "./airshield";
+import { OwnershipCeremony, ceremonyFailureMessage } from "./ceremony";
 import { PinchDial } from "./dial";
+import { type BandEnrollmentIdentity, BandIdentityMismatchError, verifyPreimage } from "./identity";
 import type { BandEvent, BandGesture, BandHand } from "./gestures";
 import { BandProtocolError, BandWire, DataXReceiver, type DataXFrame, ProtoFields, be16, be32, concat } from "./wire";
 
@@ -17,15 +25,8 @@ interface HandRequest {
 
 export interface SessionOptions {
   configChannel?: number;
-  phasedLinkSetup?: boolean;
-  /// Never auto-send the subscription; the caller drives follow-ups with encryptFrame (experiments).
-  manualLinkSetup?: boolean;
-  /// Add EnableEncryption field 7 (phased_link_setup_supported) when defined.
-  enablePhasedSupported?: boolean;
-  /// Add EnableEncryption field 8 (supported_link_setup_services) when defined.
-  enableServices?: bigint;
-  /// Include the empty device-info query in phase two (default true).
-  sendDeviceInfo?: boolean;
+  enrollment?: BandEnrollmentIdentity;
+  ceremony?: OwnershipCeremony;
 }
 
 const FINGERS = ["unknown", "thumb", "index", "middle", "notApplicable"];
@@ -36,6 +37,9 @@ const DERIVED = ["unknown", "singleTap", "doubleTap", "buttonHold", "buttonRelea
   "buttonLeft", "buttonRight", "buttonPress", "buttonHoldRelease"];
 
 const event = (payload: BandEvent["payload"], receivedAt: number): BandEvent => ({ payload, receivedAt });
+const sha256 = (data: Uint8Array): Uint8Array => new Uint8Array(createHash("sha256").update(data).digest());
+
+type SetupStage = "link" | "ceremony" | "identity" | "deviceInfo" | "input";
 
 export class BandSession {
   private readonly ecdh = createECDH("prime256v1");
@@ -45,6 +49,7 @@ export class BandSession {
   private readonly base = randomBytes(4).readUInt32LE(0);
   private peerKey: Uint8Array | undefined;
   private peerChallenge: Uint8Array | undefined;
+  private peerSeed: Uint8Array | undefined;
   private pending: Uint8Array = new Uint8Array();
   private transmitter: AirShieldCipher | undefined;
   private receiver: AirShieldReceiver | undefined;
@@ -61,34 +66,28 @@ export class BandSession {
   authenticatedPackets = 0;
   motionMessages = 0;
   streamsEnabled = false;
-  // Keep these together: enable, disable, and acknowledgement must agree.
   private readonly streamFields = [3, 6, 8];
   private readonly streamChannel = 0x8005;
   private readonly configurationChannel: number;
-  private readonly phasedLinkSetup: boolean;
-  private readonly manualLinkSetup: boolean;
-  private readonly enablePhasedSupported: boolean | undefined;
-  private readonly enableServices: bigint | undefined;
-  private readonly sendDeviceInfo: boolean;
-  private phaseTwoSent = false;
+  private setupStage: SetupStage = "link";
+  private enrollment: BandEnrollmentIdentity | undefined;
+  private readonly ceremony: OwnershipCeremony | undefined;
+  private appTrusted = false;
+  private bandTrusted = false;
+  private endLinkSent = false;
+  /// Set when an enrollment ceremony finishes; the caller persists it.
+  enrolledIdentity: BandEnrollmentIdentity | undefined;
   private configurationID = 0n;
   private handRequest: HandRequest | undefined;
   hand: BandHand | undefined;
 
+  onFrame: ((frame: { channel: number; words: number[]; length: number }) => void) | undefined;
+
   constructor(options: SessionOptions = {}) {
     this.ecdh.generateKeys();
     this.configurationChannel = options.configChannel ?? 0x8006;
-    this.phasedLinkSetup = options.phasedLinkSetup ?? false;
-    this.manualLinkSetup = options.manualLinkSetup ?? false;
-    this.enablePhasedSupported = options.enablePhasedSupported;
-    this.enableServices = options.enableServices;
-    this.sendDeviceInfo = options.sendDeviceInfo ?? true;
-  }
-
-  /// Experimental: encrypt an arbitrary DataX frame with the live cipher (keeps IV/counter in sync).
-  /// Used by scripts/probe.ts to hand-drive link-setup follow-ups. Not used by the app.
-  encryptFrame(frame: Uint8Array): Uint8Array {
-    return this.encrypt(frame);
+    this.enrollment = options.enrollment;
+    this.ceremony = options.ceremony;
   }
 
   private get publicKey(): Uint8Array {
@@ -100,9 +99,6 @@ export class BandSession {
       BandWire.field(1, this.publicKey), BandWire.field(2, this.challenge), BandWire.field(3, 0),
       BandWire.field(4, 31), BandWire.field(7, 16)));
   }
-
-  /// Diagnostics hook: called for every decoded DataX frame (no plaintext payload is exposed).
-  onFrame: ((frame: { channel: number; words: number[]; length: number; payload: Uint8Array }) => void) | undefined;
 
   feed(bytes: Uint8Array, time: number): { outgoing: Uint8Array; packets: Uint8Array[]; events: BandEvent[] } {
     this.pending = concat(this.pending, bytes);
@@ -127,13 +123,9 @@ export class BandSession {
           }
           this.peerKey = point;
           this.peerChallenge = fields.bytes(2, 16);
-          // Optional link-setup negotiation fields, off by default (the app never sends them).
-          const extras = concat(
-            this.enablePhasedSupported === undefined ? new Uint8Array() : BandWire.field(7, this.enablePhasedSupported ? 1 : 0),
-            this.enableServices === undefined ? new Uint8Array() : BandWire.field(8, this.enableServices));
           outgoing.push(BandWire.frame(1, [0x02000002], concat(
             BandWire.field(1, this.publicKey), BandWire.field(2, this.seed), BandWire.field(3, this.iv),
-            BandWire.field(4, this.base), BandWire.field(5, 3), extras)));
+            BandWire.field(4, this.base), BandWire.field(5, 3))));
           break;
         }
         case 0x02000002: {
@@ -143,20 +135,28 @@ export class BandSession {
           }
           const secret = new Uint8Array(this.ecdh.computeSecret(concat(new Uint8Array([4]), point)));
           const peerSeed = fields.bytes(2, 32);
+          this.peerSeed = peerSeed;
           const peerIV = fields.bytes(3, 16);
           const peerBase = fields.integer(4);
           if (peerBase < 0n || peerBase > 0xffffffffn) throw new BandProtocolError("Invalid band packet counter");
           this.transmitter = new AirShieldCipher(AirShieldKeys.derive(secret, peerChallenge, this.seed), this.iv, this.base);
           this.receiver = new AirShieldReceiver(new AirShieldCipher(
             AirShieldKeys.derive(secret, this.challenge, peerSeed), peerIV, Number(peerBase)));
-          // Empty identity query and EndLinkSetup are required by the observed firmware.
-          outgoing.push(this.encrypt(BandWire.frame(0x8002, [0x81000024, 0x02003000])));
-          outgoing.push(this.encrypt(BandWire.frame(0x8001, [0x02001000], concat(
-            BandWire.field(1, 1), BandWire.field(2, new Uint8Array(randomBytes(16)))))));
-          // Pipelined (older firmware): subscribe in the same batch. Phased (newer firmware):
-          // wait for the band's link-setup reply on channel 1 before the 0xce56 requests.
-          // Manual: never auto-subscribe (an experiment harness drives the follow-ups).
-          if (!this.phasedLinkSetup && !this.manualLinkSetup) this.sendPhaseTwo(outgoing, time);
+          if (this.ceremony) {
+            // Enrollment startup runs the ownership ceremony instead of the identity queries.
+            this.setupStage = "ceremony";
+            outgoing.push(this.encrypt(this.ceremony.start()));
+          } else if (this.enrollment) {
+            // Enrolled startup replaces the empty identity query with an EnableTrust proof.
+            this.setupStage = "identity";
+            outgoing.push(this.encrypt(this.enableTrust(this.enrollment)));
+          } else {
+            // Un-enrolled: complete link setup before the input service (hits 0xc001 on an
+            // enrolled band; enroll or import an identity to get past it).
+            outgoing.push(this.encrypt(BandWire.frame(0x8002, [0x81000024, 0x02003000])));
+            outgoing.push(this.encrypt(BandWire.frame(0x8001, [0x02001000], concat(
+              BandWire.field(1, 1), BandWire.field(2, new Uint8Array(randomBytes(16)))))));
+          }
           break;
         }
         default:
@@ -169,12 +169,7 @@ export class BandSession {
       for (const plaintext of records) {
         this.authenticatedPackets += 1;
         for (const frame of this.datax.feed(plaintext)) {
-          this.onFrame?.({ channel: frame.channel, words: frame.words, length: frame.payload.length, payload: frame.payload });
-          // Phased link setup: the band's EndLinkSetup reply arrives on channel 1; only then subscribe.
-          if (this.phasedLinkSetup && !this.phaseTwoSent && !this.stopping && (frame.channel & 0x7fff) === 1
-            && frame.words.some((w) => w === 0x02001000)) {
-            this.sendPhaseTwo(outgoing, time);
-          }
+          this.onFrame?.({ channel: frame.channel, words: frame.words, length: frame.payload.length });
           events = events.concat(this.input(frame, time, outgoing));
         }
         if (this.streaming && !this.stopping && time - this.lastHeartbeat >= 0.2) {
@@ -205,9 +200,20 @@ export class BandSession {
     return this.requestHand(hand, false, time);
   }
 
+  /// Resume the ceremony after the pair_request HTTP exchange.
+  ceremonyPairRequestCompleted(signature: Uint8Array, receipt: string): Uint8Array {
+    if (!this.ceremony) throw new BandProtocolError("No enrollment is running");
+    return this.encrypt(this.ceremony.pairRequestCompleted(signature, receipt));
+  }
+
+  /// Resume the ceremony after the pair HTTP exchange.
+  ceremonyPairCompleted(signature: Uint8Array, receipt: string, devicePublicKey: Uint8Array | undefined): Uint8Array {
+    if (!this.ceremony) throw new BandProtocolError("No enrollment is running");
+    return this.encrypt(this.ceremony.pairCompleted(signature, receipt, devicePublicKey));
+  }
+
   private requestHand(hand: BandHand | undefined, reading: boolean, time: number): Uint8Array {
     const id = this.configurationID + 1n;
-    // ConfigReq.is_left_handed is field 10. An empty ConfigReq reads current settings.
     const config = reading ? new Uint8Array() : BandWire.field(10, hand === "left" ? 1 : 0);
     const bytes = this.encrypt(BandWire.frame(this.configurationChannel,
       this.configurationID === 0n ? [0x8100ce56, 0x02000314] : [],
@@ -230,7 +236,6 @@ export class BandSession {
       return [event({ type: "handednessFailure", message: "The band couldn't apply its hand setting. Reconnect and try again." }, time)];
     }
     if (!request.reading) {
-      // Read it again independently; a successful write status alone isn't confirmation.
       outgoing.push(this.requestHand(request.hand, true, time));
       return [];
     }
@@ -252,7 +257,6 @@ export class BandSession {
     return events;
   }
 
-  /// Read the existing subscription's status when sensor traffic goes quiet.
   queryStreamState(): Uint8Array {
     if (!this.streamsEnabled || this.stopping) return new Uint8Array();
     return this.streamRequest(5n, undefined);
@@ -262,7 +266,7 @@ export class BandSession {
     if (this.stopping) return new Uint8Array();
     this.stopping = true;
     this.handRequest = undefined;
-    if (!this.transmitter) return new Uint8Array();
+    if (!this.transmitter || this.setupStage !== "input") return new Uint8Array();
     return this.streamRequest(4n, false);
   }
 
@@ -271,17 +275,104 @@ export class BandSession {
     return this.transmitter.encrypt(data);
   }
 
-  /// The 0xce56 requests that need link setup complete: device info, subscription, hand read.
-  private sendPhaseTwo(outgoing: Uint8Array[], time: number): void {
-    if (this.phaseTwoSent) return;
-    this.phaseTwoSent = true;
-    if (this.sendDeviceInfo) {
+  /// The confirmed transcript preimage; SHA-256 of it is the signed digest.
+  private static trustPreimage(challenge: Uint8Array, receiver: Uint8Array, seed: Uint8Array, sender: Uint8Array): Uint8Array {
+    return concat(sha256(concat(challenge, receiver)), sha256(concat(seed, sender)));
+  }
+
+  /// Host EnableTrust on the identity service channel, replacing the empty identity query.
+  private enableTrust(identity: BandEnrollmentIdentity, serviceOpen = false): Uint8Array {
+    if (!this.peerKey || !this.peerChallenge) throw new BandProtocolError("Band encryption is not ready");
+    const preimage = BandSession.trustPreimage(this.peerChallenge, this.peerKey, this.seed, this.publicKey);
+    const signature = identity.privateKey.signPreimage(preimage);
+    return BandWire.frame(0x8002, serviceOpen ? [0x02001000] : [0x81000024, 0x02001000],
+      concat(BandWire.field(1, sha256(identity.privateKey.publicPoint)), BandWire.field(2, signature)));
+  }
+
+  private receiveCeremony(frame: DataXFrame, time: number, outgoing: Uint8Array[]): BandEvent[] {
+    const ceremony = this.ceremony;
+    const kind = frame.words[frame.words.length - 1];
+    if (!ceremony || kind === undefined) return [];
+    if ((kind & 0xff000000) === 0x03000000) {
+      throw new BandProtocolError(ceremonyFailureMessage(kind & 0xffffff));
+    }
+    switch (kind) {
+      case 0x02003001:
+        outgoing.push(this.encrypt(ceremony.identityRead(frame.payload)));
+        return [event({ type: "ceremonyStage", message: "reading the band identity" }, time)];
+      case 0x02002001: {
+        const request = ceremony.skipChallenge(frame.payload);
+        return [event({ type: "ceremonyStage", message: "claiming the band" }, time),
+          event({ type: "ceremonyHTTP", request: { kind: "pairRequest", data: request } }, time)];
+      }
+      case 0x02002003: {
+        const pair = ceremony.startChangeOwner(frame.payload);
+        return [event({ type: "ceremonyStage", message: "confirming ownership" }, time),
+          event({ type: "ceremonyHTTP", request: { kind: "pair", data: pair } }, time)];
+      }
+      case 0x02002005: {
+        const identity = ceremony.complete(frame.words, frame.payload);
+        return [this.adoptEnrolledIdentity(identity, outgoing, time)];
+      }
+      default:
+        return [];
+    }
+  }
+
+  private adoptEnrolledIdentity(identity: BandEnrollmentIdentity, outgoing: Uint8Array[], time: number): BandEvent {
+    this.enrollment = identity;
+    this.enrolledIdentity = identity;
+    this.appTrusted = false;
+    this.bandTrusted = false;
+    this.endLinkSent = false;
+    this.setupStage = "identity";
+    outgoing.push(this.encrypt(this.enableTrust(identity, true)));
+    return event({ type: "ceremonyStage", message: "establishing trust" }, time);
+  }
+
+  private receiveIdentity(frame: DataXFrame, outgoing: Uint8Array[]): BandEvent[] {
+    const kind = frame.words[frame.words.length - 1];
+    if (kind === undefined) return [];
+    if ((kind & 0xff000000) === 0x03000000 && frame.channel === 2) {
+      if (kind !== 0x03001000) {
+        if (kind === 0x03001043) {
+          throw new BandIdentityMismatchError("band enrolled to a different key. forget the stored band identity to reconnect without it.");
+        }
+        throw new BandIdentityMismatchError(`the band rejected the stored identity (${kind.toString(16)}). try reconnecting.`);
+      }
+      this.appTrusted = true;
+    } else if (kind === 0x02001001 && (frame.channel & 0x8000) !== 0) {
+      if (this.bandTrusted) throw new BandProtocolError("The band sent a duplicate identity proof");
+      const fields = new ProtoFields(frame.payload);
+      if (!this.peerKey || !this.peerSeed) throw new BandProtocolError("Band encryption is not ready");
+      const signature = fields.bytes(2, 64);
+      const bandKey = this.enrollment?.bandPublicKey;
+      if (bandKey) {
+        const preimage = BandSession.trustPreimage(this.challenge, this.publicKey, this.peerSeed, this.peerKey);
+        if (!verifyPreimage(bandKey, preimage, signature)) {
+          throw new BandProtocolError("The band's identity proof didn't verify. Try reconnecting.");
+        }
+      }
+      this.bandTrusted = true;
+      outgoing.push(this.encrypt(BandWire.frame(frame.channel & 0x7fff, [0x03001000])));
+    } else if (kind === 0x02001000 && frame.channel === 0x8001 && this.endLinkSent) {
+      const fields = new ProtoFields(frame.payload);
+      if (fields.requiredInteger(1) !== 1n || fields.bytes(2).length !== 16) {
+        throw new BandProtocolError("Unexpected band link setup response");
+      }
+      this.setupStage = "deviceInfo";
       outgoing.push(this.encrypt(BandWire.frame(0x8003, [0x8100ce56, 0x02000314], concat(
         BandWire.field(1, 1), BandWire.field(3, new Uint8Array())))));
+      return [];
+    } else {
+      return [];
     }
-    outgoing.push(this.streamRequest(2n, undefined));
-    outgoing.push(this.streamRequest(3n, true));
-    outgoing.push(this.requestHand(undefined, true, time));
+    if (this.appTrusted && this.bandTrusted && !this.endLinkSent) {
+      this.endLinkSent = true;
+      outgoing.push(this.encrypt(BandWire.frame(0x8001, [0x02001000], concat(
+        BandWire.field(1, 1), BandWire.field(2, new Uint8Array(randomBytes(16)))))));
+    }
+    return [];
   }
 
   private streamRequest(id: bigint, enabled: boolean | undefined): Uint8Array {
@@ -310,22 +401,64 @@ export class BandSession {
     }
     const kind = this.channelTypes.get(frame.channel);
     if (kind === undefined) return [];
-    // Ignore unrelated services without trying to interpret their protobuf schema.
+
+    if (this.ceremony && this.setupStage === "ceremony" && !this.stopping) {
+      return this.receiveCeremony(frame, time, outgoing);
+    }
+    if (this.enrollment && this.setupStage === "identity" && !this.stopping) {
+      return this.receiveIdentity(frame, outgoing);
+    }
+    if (kind === 0x02001000 && frame.channel === 0x8001 && this.setupStage === "link" && !this.stopping) {
+      const fields = new ProtoFields(frame.payload);
+      if (fields.requiredInteger(1) !== 1n) {
+        throw new BandProtocolError("The band couldn't finish setting up the connection. Try reconnecting.");
+      }
+      this.setupStage = "deviceInfo";
+      outgoing.push(this.encrypt(BandWire.frame(0x8003, [0x8100ce56, 0x02000314], concat(
+        BandWire.field(1, 1), BandWire.field(3, new Uint8Array())))));
+      return [];
+    }
+    if (kind === 0x0300c001 && !this.stopping) {
+      if (frame.channel === 3 && this.setupStage === "deviceInfo") {
+        throw new BandProtocolError("The band rejected gesture setup. Try reconnecting.");
+      }
+      if (frame.channel === 5 && this.setupStage === "input") {
+        throw new BandProtocolError("The band rejected the input subscription. Try reconnecting.");
+      }
+      if (frame.channel === 6 && this.handRequest) {
+        this.handRequest = undefined;
+        this.hand = undefined;
+        return [event({ type: "handednessFailure", message: "The band couldn't report its hand setting. Reconnect and try again." }, time)];
+      }
+      return [];
+    }
     if (![0x02000315, 0x0200020d, 0x0200020f, 0x02000212].includes(kind)) return [];
+    if (kind === 0x02000315 && frame.channel === 3 && this.setupStage === "deviceInfo" && !this.stopping) {
+      const fields = new ProtoFields(frame.payload);
+      if (fields.requiredInteger(1) !== 1n) return [];
+      if (fields.requiredInteger(2) !== 1n) throw new BandProtocolError("The band rejected gesture setup. Try reconnecting.");
+      this.setupStage = "input";
+      outgoing.push(this.streamRequest(2n, undefined));
+      outgoing.push(this.streamRequest(3n, true));
+      outgoing.push(this.requestHand(undefined, true, time));
+      return [];
+    }
+    if (this.setupStage !== "input") return [];
     if (kind === 0x02000315 && (frame.channel & 0x7fff) === (this.configurationChannel & 0x7fff)) {
       if (this.stopping) return [];
       return this.receiveHand(new ProtoFields(frame.payload), time, outgoing);
     }
-    if (kind === 0x02000315 && (frame.channel & 0x7fff) !== (this.streamChannel & 0x7fff)) return [];
+    if (kind === 0x02000315 && frame.channel !== (this.streamChannel & 0x7fff)) return [];
     const fields = new ProtoFields(frame.payload);
     if (kind === 0x02000315) {
       const request = fields.integer(1);
       if (request === 3n || request === 5n) {
+        if (this.stopping) return [];
         if (fields.integer(2) !== 1n) throw new BandProtocolError("The band rejected the input subscription");
         const flags = new ProtoFields(fields.bytes(5));
         this.streamsEnabled = this.streamFields.every((f) => flags.contains(f) && flags.integer(f) === 1n);
         if (!this.streamsEnabled) throw new BandProtocolError("The band input subscription stopped");
-        if (!this.streaming && !this.stopping) {
+        if (!this.streaming) {
           this.streaming = true;
           return [event({ type: "connected" }, time)];
         }

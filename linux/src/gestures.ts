@@ -1,6 +1,8 @@
 // Gesture types, de-duplication, dial step routing, and action gating.
 // Port of Sources/KinesisCore/Gestures.swift with MacAction generalised to Action.
 
+import type { CeremonyHTTPRequest } from "./ceremony";
+
 export type BandHand = "right" | "left";
 
 export interface BandDevice {
@@ -31,7 +33,9 @@ export type BandEventPayload =
   | { type: "dialState"; engaged: boolean }
   | { type: "dialTurn"; rotation: number }
   | { type: "handedness"; hand: BandHand }
-  | { type: "handednessFailure"; message: string };
+  | { type: "handednessFailure"; message: string }
+  | { type: "ceremonyStage"; message: string }
+  | { type: "ceremonyHTTP"; request: CeremonyHTTPRequest };
 
 export interface BandEvent {
   payload: BandEventPayload;

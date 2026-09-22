@@ -5,8 +5,13 @@ import { parseArgs } from "node:util";
 import { ALL_ACTIONS, KdeBackend, LoggingBackend, backendFor } from "./actions";
 import * as bluez from "./bluez";
 import { type Config, DEFAULT_CONFIG, configPath, loadConfig, saveConfig } from "./config";
+import { OwnershipCeremony } from "./ceremony";
+import { type BandEvent } from "./gestures";
 import { BandConnection, KinesisError, type Logger } from "./connection";
 import { Controller } from "./controller";
+import { BandIdentity } from "./identity";
+import { MetaAuth, type MetaSession, MetaSessionStore, authEntryURL } from "./meta-auth";
+import { MetaPairClient, MetaSessionInvalidError } from "./meta-pair";
 import {
   ACTION_TITLES, type BandDevice, type BandHand, DIAL_TARGETS, type DialTarget, SWIPE_DIRECTIONS, TAP_GESTURES,
   isAction, recognizedLabel,
@@ -17,6 +22,7 @@ const USAGE = `kinesis — use your Meta Neural Band to control Linux
 
 usage:
   kinesis scan [--seconds N] [--select ADDRESS]   find bands in pairing mode; remembers the strongest
+  kinesis enroll [--login] [--verbose]            claim the band to your Meta account (needed once, for stable sessions)
   kinesis pair [ADDRESS]                          bond through BlueZ (only if your firmware asks for it)
   kinesis run [--practice] [--verbose]            connect and enable controls (--practice only prints)
   kinesis hand left|right                         write the band's hand setting and confirm it
@@ -129,8 +135,11 @@ async function run(args: string[]): Promise<void> {
     }
   }, 50);
   let lastAction = "";
+  const enrollment = await BandIdentity.enrollment(band.address);
+  if (enrollment) console.log(`${stamp()} using enrolled band identity (${BandIdentity.path(band.address)})`);
+  else console.warn(`${stamp()} no enrolled identity for this band; the session may last only ~30 s. Run \`kinesis enroll\` for a stable connection.`);
   console.log(`Connecting to ${describe(band)} with the ${backend.name} backend${values.practice ? " (practice: actions are only printed)" : ""}.`);
-  controller.connect(band, { enableControls: true });
+  controller.connect(band, { enableControls: true, ...(enrollment ? { enrollment } : {}) });
   const shutdown = async () => {
     console.log("");
     clearInterval(onAction);
@@ -140,6 +149,87 @@ async function run(args: string[]): Promise<void> {
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
   await new Promise(() => {});
+}
+
+/// Obtain a Meta account session: reuse a saved one, or run the webview sign-in. The user signs
+/// in on Meta's own page in their browser and pastes back the fb-viewapp:// callback URL; this
+/// client only ever sees the returned blob, never the password.
+async function obtainMetaSession(forceLogin: boolean): Promise<MetaSession> {
+  if (!forceLogin) {
+    const saved = await MetaSessionStore.restore();
+    if (saved) { console.log("Using saved Meta account session."); return saved; }
+  }
+  const tokens = await MetaAuth.tokensQuery();
+  console.log("\nOpen this URL in your browser and sign in to your Meta account:\n");
+  console.log("  " + authEntryURL(tokens) + "\n");
+  console.log("After signing in, the page redirects to a URL beginning with `fb-viewapp://frl_login`.");
+  console.log("Your browser can't open that scheme, so copy the full URL (from the address bar or the");
+  console.log("blocked-redirect error) and paste it here.\n");
+  const callback = (prompt("Paste the fb-viewapp:// callback URL:") ?? "").trim();
+  if (!callback) throw new KinesisError("No callback URL provided.");
+  const { token, blob } = MetaAuth.parseCallback(callback);
+  if (!blob || !MetaAuth.callbackMatches(token, tokens.nativeSSOToken)) {
+    throw new KinesisError("That callback URL didn't match this sign-in. Start `kinesis enroll` again.");
+  }
+  const frl = await MetaAuth.decryptBlob(blob, tokens.nativeSSOToken);
+  const session = await MetaAuth.login(frl);
+  await MetaSessionStore.save(session);
+  console.log(`Signed in as Meta user ${session.userID}. Session saved to ${MetaSessionStore.path()}.`);
+  return session;
+}
+
+async function enroll(args: string[]): Promise<void> {
+  const { values } = parseArgs({ args, options: { login: { type: "boolean", default: false }, verbose: { type: "boolean", default: false } } });
+  const config = await loadConfig();
+  const band = savedBand(config);
+  const log = logger(values.verbose);
+  if (await BandIdentity.exists(band.address)) {
+    console.log(`This band already has an enrolled identity (${BandIdentity.path(band.address)}). Re-enrolling replaces it.`);
+  }
+  const session = await obtainMetaSession(values.login);
+  const connection = new BandConnection(log);
+  console.log("\nPut the band in pairing mode (press its button) and keep it on your wrist.");
+
+  const enrolled = await new Promise<boolean>((resolve, reject) => {
+    const start = (pairClient: MetaPairClient) => {
+      const ceremony = new OwnershipCeremony(band.address);
+      connection.start(
+        { kind: "connect", band, security: config.security, session: { configChannel: config.configChannel, ceremony }, bond: config.bond, directL2cap: config.directL2cap, psm: config.psm, pairClient },
+        (event: BandEvent) => {
+          if (event.payload.type === "ceremonyStage") console.log(`${stamp()} enrollment: ${event.payload.message}`);
+          if (event.payload.type === "connected") {
+            const identity = connection.enrolled;
+            if (identity) {
+              BandIdentity.save(identity, band.address)
+                .then(() => { console.log(`${stamp()} enrolled and streaming. Identity saved to ${BandIdentity.path(band.address)}.`); resolve(true); })
+                .catch(reject);
+            } else {
+              console.log(`${stamp()} connected, but no enrolled identity was produced.`);
+              resolve(false);
+            }
+            connection.stop();
+          }
+        },
+        (error) => { if (error) reject(error); },
+      ).catch(reject);
+    };
+    start(new MetaPairClient(session));
+  }).catch(async (error: unknown) => {
+    if (error instanceof MetaSessionInvalidError) {
+      await MetaSessionStore.delete();
+      fail("Your Meta session expired. Run `kinesis enroll --login` to sign in again.");
+    }
+    throw error;
+  });
+  await connection_stopAndWait(connection);
+  if (!enrolled) fail("Enrollment did not complete.");
+  console.log("Done. Run `kinesis run` for a stable, auto-reconnecting session.");
+}
+
+async function connection_stopAndWait(connection: BandConnection): Promise<void> {
+  connection.stop();
+  const deadline = Date.now() + 5000;
+  while (connection.active && Date.now() < deadline) await Bun.sleep(100);
 }
 
 async function hand(args: string[]): Promise<void> {
@@ -293,6 +383,12 @@ async function doctor(): Promise<void> {
       if (state) check("Band state", true, `connected ${state.connected}, paired ${state.paired}, trusted ${state.trusted}`);
     }
   }
+  if (config.band) {
+    const enrolled = await BandIdentity.exists(config.band.address);
+    check("Band enrollment", enrolled, enrolled ? BandIdentity.path(config.band.address) : "run `kinesis enroll` for stable sessions");
+  }
+  const metaSession = await MetaSessionStore.restore();
+  check("Meta session", metaSession !== undefined, metaSession ? `user ${metaSession.userID}` : "run `kinesis enroll` (sign in once)");
   check("Config", true, configPath());
   for (const [name, ok, detail] of rows) console.log(`  ${ok ? "✓" : "✗"} ${name.padEnd(20)} ${detail}`);
   if (rows.some(([, ok]) => !ok)) process.exitCode = 1;
@@ -316,6 +412,7 @@ async function main(): Promise<void> {
   try {
     switch (command) {
       case "scan": return await scan(args);
+      case "enroll": return await enroll(args);
       case "pair": return await pair(args);
       case "run": return await run(args);
       case "hand": return await hand(args);

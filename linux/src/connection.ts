@@ -5,9 +5,10 @@ import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import * as bluez from "./bluez";
+import type { CeremonyPairData, CeremonyPairRequestData } from "./ceremony";
 import type { BandDevice, BandEvent, BandHand } from "./gestures";
 import { L2capChannel, type SecurityLevel } from "./l2cap";
-import { BandSession } from "./session";
+import { BandSession, type SessionOptions } from "./session";
 import { concat } from "./wire";
 
 export class KinesisError extends Error {
@@ -17,10 +18,16 @@ export class KinesisError extends Error {
   }
 }
 
-export interface SessionOptions { configChannel?: number; phasedLinkSetup?: boolean }
+/// The two ownership HTTP exchanges the enrollment ceremony pauses for.
+export interface BandPairClient {
+  pairRequest(data: CeremonyPairRequestData): Promise<{ signature: Uint8Array; receipt: string }>;
+  pair(data: CeremonyPairData): Promise<{ signature: Uint8Array; receipt: string; devicePublicKey: Uint8Array | undefined }>;
+}
+
+export type { SessionOptions };
 export type BandOperation =
   | { kind: "scan"; seconds: number }
-  | { kind: "connect"; band: BandDevice; security: SecurityLevel; session?: SessionOptions; bond?: boolean; directL2cap?: boolean; psm?: number };
+  | { kind: "connect"; band: BandDevice; security: SecurityLevel; session?: SessionOptions; bond?: boolean; directL2cap?: boolean; psm?: number; pairClient?: BandPairClient };
 
 export interface Logger {
   info(message: string): void;
@@ -75,11 +82,18 @@ export class BandConnection {
   private disconnecting = false;
   private failure: Error | undefined;
   private release: (() => Promise<void>) | undefined;
+  private pairClient: BandPairClient | undefined;
+  private ceremonyBusy = false;
 
   constructor(private readonly log: Logger) {}
 
   get active(): boolean {
     return this.onEnd !== undefined;
+  }
+
+  /// The identity produced by a just-run enrollment ceremony, for the caller to persist.
+  get enrolled(): import("./identity").BandEnrollmentIdentity | undefined {
+    return this.session?.enrolledIdentity;
   }
 
   async start(operation: BandOperation, onEvent: (event: BandEvent) => void, onEnd: (error: Error | undefined) => void): Promise<void> {
@@ -97,6 +111,7 @@ export class BandConnection {
     if (operation.kind === "scan") {
       this.scan(operation.seconds).catch((error: unknown) => this.fail(error));
     } else {
+      this.pairClient = operation.pairClient;
       this.connect(operation.band, operation).catch((error: unknown) => this.fail(error));
     }
   }
@@ -217,7 +232,7 @@ export class BandConnection {
     try {
       this.log.info("L2CAP channel opened");
       this.session = new BandSession(session);
-      this.session.onFrame = (frame) => this.log.info(`  frame ch=0x${frame.channel.toString(16)} words=[${frame.words.map((w) => "0x" + w.toString(16)).join(",")}] len=${frame.length}${frame.payload.length ? " payload=" + Array.from(frame.payload.subarray(0, 48), (b) => b.toString(16).padStart(2, "0")).join("") : ""}`);
+      this.session.onFrame = (frame) => this.log.info(`  frame ch=0x${frame.channel.toString(16)} words=[${frame.words.map((w) => "0x" + w.toString(16)).join(",")}] len=${frame.length}`);
       this.channel?.write(this.session.request());
     } catch (error) {
       this.fail(error);
@@ -241,6 +256,11 @@ export class BandConnection {
         if (event.payload.type === "connected") {
           this.deadline = Infinity;
           this.log.notice("Band input subscription ready");
+        } else if (event.payload.type === "ceremonyStage") {
+          this.deadline = now() + 40; // the ownership ceremony makes HTTP round-trips
+          this.log.notice(`Enrollment: ${event.payload.message}`);
+        } else if (event.payload.type === "ceremonyHTTP") {
+          this.runCeremonyHTTP(event.payload.request);
         }
         this.emit(event);
       }
@@ -248,6 +268,28 @@ export class BandConnection {
     } catch (error) {
       this.fail(error);
     }
+  }
+
+  /// The ownership ceremony pauses the wire flow for a Meta HTTP round-trip. Perform it, then
+  /// resume the session with the server's reply. Errors fail the connection.
+  private runCeremonyHTTP(request: { kind: "pairRequest"; data: CeremonyPairRequestData } | { kind: "pair"; data: CeremonyPairData }): void {
+    const session = this.session;
+    const client = this.pairClient;
+    if (!session || !client) {
+      this.fail(new KinesisError("This band needs enrollment, but no Meta account session is available. Run `kinesis enroll`."));
+      return;
+    }
+    this.ceremonyBusy = true;
+    const resume = async (): Promise<void> => {
+      if (request.kind === "pairRequest") {
+        const pending = await client.pairRequest(request.data);
+        this.channel?.write(session.ceremonyPairRequestCompleted(pending.signature, pending.receipt));
+      } else {
+        const final = await client.pair(request.data);
+        this.channel?.write(session.ceremonyPairCompleted(final.signature, final.receipt, final.devicePublicKey));
+      }
+    };
+    resume().catch((error: unknown) => this.fail(error)).finally(() => { this.ceremonyBusy = false; });
   }
 
   private channelClosed(reason?: string): void {
@@ -271,6 +313,8 @@ export class BandConnection {
   private tick(): void {
     if (!this.onEnd) return;
     const time = now();
+    // Don't time out while a ceremony HTTP round-trip is in flight.
+    if (this.ceremonyBusy) this.deadline = Math.max(this.deadline, time + 40);
     if (time >= this.deadline) {
       if (this.disconnecting) { void this.finish(); return; }
       if (this.stopping) { this.disconnect(); return; }

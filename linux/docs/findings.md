@@ -202,3 +202,25 @@ Implication: the post-session dormancy is the band, not our connect method. Neit
 nor BlueZ can page a device that is not advertising, so no client — the Mac app included — can
 reconnect without a button press. Each button press yields one ~30-50 s session; then the band is
 dark until pressed again. This is hardware behavior in standalone (no glasses/phone) operation.
+
+## RESOLVED: the ~30 s cap is the owner gate; enrollment fixes it (2026-09-20)
+
+The kinesis author confirmed on the same firmware (`297b870dc9be+`) that a properly enrolled band
+streams for minutes and auto-reconnects. The `0xc001` gate and the ~30 s teardown are the same
+thing: the band opens its input service only to a client that proves ownership with the key the
+band was enrolled with. The companion app does that proof automatically; our fresh-key sessions
+could not, so the band dropped us.
+
+The fix, ported here as `kinesis enroll`:
+- Sign in to the user's Meta account (webview SSO; the client only handles the returned blob).
+- Run the BLE ownership ceremony (identity read, skip-challenge nonce, start/finish change-owner),
+  with two `graph.facebook-hardware.com` calls (`pair_request`, `pair`) that claim the band.
+- Persist a P-256 signing key. Every later `run` sends `EnableTrust` (a signature over the session
+  transcript) on channel `0x8002` instead of the empty identity query, and verifies the band's own
+  `EnableTrustEC` proof, before link setup completes.
+
+Ported modules: `identity.ts` (key + keychain→file storage), `ceremony.ts` (BLE ceremony),
+`meta-auth.ts` (account sign-in), `meta-pair.ts` (hardware-graph pairing). The trust handshake and
+the staged/enrolled setup state machine are covered by offline tests against a synthetic band.
+This supersedes the earlier "not clearable client-side" conclusion, which was measured before the
+enrollment key was in play.

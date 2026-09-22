@@ -22,8 +22,20 @@ cd linux
 bun install
 bun run src/cli.ts doctor      # checks bluetooth, tools, and permissions
 bun run src/cli.ts scan        # finds the band and remembers it
+bun run src/cli.ts enroll      # claims the band to your Meta account (once)
 bun run src/cli.ts run         # connects, enables controls, and reconnects if the link drops
 ```
+
+## enrollment
+
+the band gates its sensor stream to whichever key it was enrolled with. without that key a fresh
+session is dropped after ~30 s (`0xc001`). `kinesis enroll` claims the band to your meta account and
+stores a signing key locally, so every later `run` proves ownership with a per-session trust
+handshake and streams indefinitely — the same thing the phone app does. you sign in on meta's own
+page in your browser and paste back the `fb-viewapp://frl_login…` url the sign-in ends on; this
+client never sees your password, only the returned blob. the key lives in
+`~/.local/state/kinesis/identity/` and the meta session in `~/.local/state/kinesis/meta-session.json`.
+run it once with the band in pairing mode; after that just `kinesis run`.
 
 `run --practice` connects and prints gestures without sending anything to the desktop. `run --verbose` logs the bluetooth steps. ctrl-c disables the band's streams cleanly before exiting.
 
@@ -86,6 +98,7 @@ the tested firmware accepts a fresh encrypted session without a bluetooth bond, 
 ## how it works
 
 - `src/wire.ts`, `src/airshield.ts`, `src/session.ts`, `src/dial.ts`, `src/gestures.ts` — the protocol and gesture core, ported one to one from the swift sources. transport agnostic.
+- `src/ceremony.ts`, `src/identity.ts`, `src/meta-auth.ts`, `src/meta-pair.ts` — band enrollment: the ownership ceremony, the persistent p-256 signing identity, the meta account sign-in, and the hardware-graph pairing calls.
 - `src/bluez.ts` + `src/dbus-text.ts` — bluez through `busctl`, parsing its typed text output (busctl's json mode can't serialise the `a{qv}` manufacturer data that phones advertise).
 - `src/l2cap.ts` + `src/l2cap-worker.ts` — `AF_BLUETOOTH` seqpacket socket through `bun:ffi`. reads block in a worker thread and are posted to the main thread; writes go straight to the descriptor.
 - `src/connection.ts` — one band connection: bluez connect, psm read, l2cap open, handshake, subscription, status queries when quiet, clean shutdown with the disable acknowledgement.
@@ -96,8 +109,10 @@ the tested firmware accepts a fresh encrypted session without a bluetooth bond, 
 
 ## limits
 
-- **firmware gate**: verified end to end against a real band (`Meta Band XXXX`, hardware `Swiftlet-PS`): bluez connect, l2cap open, the airshield handshake, and packet decryption all work. that firmware then gates the input service behind a newer link-setup step (`0xc001`) that the mac app and the upstream poc also do not pass; see [docs/findings.md](docs/findings.md). older firmware should subscribe normally. `kinesis run --verbose` and `bun run scripts/probe.ts` show every setup frame.
-- `linkSetup` (`pipelined` default, or `phased`) and `configChannel` (`0x8006` or `0x8007`) are exposed for firmware that sequences link setup differently.
+- **enrollment required for stable sessions**: an un-enrolled band drops the stream after ~30 s
+  (`0xc001` owner gate). `kinesis enroll` fixes this by claiming the band to your meta account; see
+  [docs/findings.md](docs/findings.md). enrollment talks to meta's servers and needs a browser
+  sign-in.
 - the l2cap receive mtu is requested at 8 kib; kernels that reject setting it before connect keep their default, which still carries the band's frames.
 - previous/next window use kwin's walk-through shortcuts, which switch immediately when invoked over d-bus.
 - brightness uses powerdevil, so external displays without ddc support won't respond.

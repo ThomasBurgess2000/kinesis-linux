@@ -4,6 +4,7 @@
 import type { ActionBackend } from "./actions";
 import type { Config } from "./config";
 import { type BandOperation, type Logger, now } from "./connection";
+import type { BandEnrollmentIdentity } from "./identity";
 import {
   ACTION_TITLES, type Action, ActionGate, type BandDevice, type BandEvent, type BandHand, DialRouter, GestureRouter,
   type RecognizedGesture, type SwipeDirection, dialAction, gestureLabel, recognizedLabel,
@@ -64,7 +65,7 @@ export class Controller {
   private ticker: ReturnType<typeof setInterval> | undefined;
   private band: BandDevice | undefined;
   private enableWhenLive = false;
-  private readonly sessionOptions: { configChannel: number; phasedLinkSetup: boolean };
+  private enrollment: BandEnrollmentIdentity | undefined;
 
   constructor(
     private readonly config: Config,
@@ -76,18 +77,27 @@ export class Controller {
   ) {
     this.state.bandHand = config.hand ?? "right";
     this.started = clock();
-    this.sessionOptions = { configChannel: config.configChannel, phasedLinkSetup: config.linkSetup === "phased" };
   }
 
-  /// Connect and keep reconnecting until disconnect() is called.
-  connect(band: BandDevice, options: { enableControls: boolean }): void {
+  private connectOperation(band: BandDevice): BandOperation {
+    return {
+      kind: "connect", band, security: this.config.security,
+      session: { configChannel: this.config.configChannel, ...(this.enrollment ? { enrollment: this.enrollment } : {}) },
+      bond: this.config.bond, directL2cap: this.config.directL2cap, psm: this.config.psm,
+    };
+  }
+
+  /// Connect and keep reconnecting until disconnect() is called. Pass the enrolled identity to
+  /// prove band ownership each session (without it, an enrolled band closes the input service).
+  connect(band: BandDevice, options: { enableControls: boolean; enrollment?: BandEnrollmentIdentity }): void {
     if (this.busy || this.quitting) return;
     this.band = band;
+    this.enrollment = options.enrollment;
     this.wantsConnection = true;
     this.enableWhenLive = options.enableControls;
     this.retries = 0;
     this.ticker ??= setInterval(() => this.tick(), 500);
-    this.run({ kind: "connect", band, security: this.config.security, session: this.sessionOptions, bond: this.config.bond, directL2cap: this.config.directL2cap, psm: this.config.psm });
+    this.run(this.connectOperation(band));
   }
 
   async disconnect(): Promise<void> {
@@ -329,7 +339,7 @@ export class Controller {
     this.retry = setTimeout(() => {
       this.retry = undefined;
       if (!this.wantsConnection || this.quitting || !this.band) return;
-      this.run({ kind: "connect", band: this.band, security: this.config.security, session: this.sessionOptions, bond: this.config.bond, directL2cap: this.config.directL2cap, psm: this.config.psm });
+      this.run(this.connectOperation(this.band));
     }, delay * 1000);
   }
 
