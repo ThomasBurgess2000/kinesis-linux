@@ -165,7 +165,7 @@ async function obtainMetaSession(forceLogin: boolean): Promise<MetaSession> {
   let callback: string | undefined;
   if (canCaptureCallback()) {
     console.log("\nA browser will open Meta's sign-in page. Sign in there; the callback is captured");
-    console.log("automatically (a temporary handler for the fb-viewapp:// scheme, removed afterward).");
+    console.log("automatically (a temporary handler for the oculus:// and fb-viewapp:// schemes, removed afterward).");
     console.log("\nIf the browser doesn't open, paste this URL into it manually:\n\n  " + url + "\n");
     callback = await captureCallback(180_000, async () => {
       if (!(await openInBrowser(url))) console.log("(couldn't launch a browser automatically — open the URL above)");
@@ -175,9 +175,9 @@ async function obtainMetaSession(forceLogin: boolean): Promise<MetaSession> {
     console.log("\nOpen this URL in your browser and sign in to your Meta account:\n\n  " + url + "\n");
   }
   if (!callback) {
-    console.log("After signing in, the page redirects to a URL beginning with `fb-viewapp://frl_login`.");
+    console.log("After signing in, the page redirects to a URL like `oculus://frl_login/?...` (or `fb-viewapp://`).");
     console.log("If you can copy that URL, paste it here; otherwise press enter to cancel.\n");
-    callback = (prompt("Paste the fb-viewapp:// callback URL (or enter to cancel):") ?? "").trim();
+    callback = (prompt("Paste the oculus:// (or fb-viewapp://) callback URL (or enter to cancel):") ?? "").trim();
   }
   if (!callback) throw new KinesisError("No callback captured. Run `kinesis enroll` again.");
   const { token, blob } = MetaAuth.parseCallback(callback);

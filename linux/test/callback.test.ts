@@ -12,7 +12,7 @@ test("captureCallback registers a handler, captures the URL, and cleans up", asy
   process.env.XDG_STATE_HOME = join(base, "state");
   process.env.XDG_DATA_HOME = join(base, "data");
   process.env.XDG_CONFIG_HOME = join(base, "config");
-  const target = "fb-viewapp://frl_login?token=abcdef0123456789&blob=SGVsbG8%3D";
+  const target = "oculus://frl_login/?token=abcdef0123456789&blob=SGVsbG8%3D";
   try {
     const captured = await captureCallback(6000, async () => {
       // The default handler for the scheme is now ours; running its Exec is what xdg-open does.

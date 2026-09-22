@@ -9,7 +9,9 @@ import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-const SCHEME = "x-scheme-handler/fb-viewapp";
+// The sign-in ends on a custom-scheme redirect carrying the token and blob. Which scheme depends
+// on the Meta build: observed as oculus://frl_login/ and fb-viewapp://frl_login. Register both.
+const SCHEMES = ["oculus", "fb-viewapp"];
 const DESKTOP = "kinesis-enroll-callback.desktop";
 
 function stateDir(): string {
@@ -45,14 +47,18 @@ export async function captureCallback(timeoutMs: number, onReady: () => void | P
   // The handler writes its URL argument to the callback file and exits.
   await Bun.write(scriptPath, `#!/bin/sh\nprintf '%s' "$1" > ${JSON.stringify(callbackPath)}\n`);
   chmodSync(scriptPath, 0o755);
+  const mimeTypes = SCHEMES.map((s) => `x-scheme-handler/${s}`).join(";");
   await Bun.write(desktopPath, [
     "[Desktop Entry]", "Type=Application", "Name=Kinesis Enroll Callback",
-    `Exec=${scriptPath} %u`, `MimeType=${SCHEME};`, "NoDisplay=true", "Terminal=false", "",
+    `Exec=${scriptPath} %u`, `MimeType=${mimeTypes};`, "NoDisplay=true", "Terminal=false", "",
   ].join("\n"));
 
-  const previous = (await $`xdg-mime query default ${SCHEME}`.quiet().nothrow().text()).trim();
+  const previous: Record<string, string> = {};
+  for (const scheme of SCHEMES) {
+    previous[scheme] = (await $`xdg-mime query default ${"x-scheme-handler/" + scheme}`.quiet().nothrow().text()).trim();
+  }
   if (Bun.which("update-desktop-database")) await $`update-desktop-database ${applicationsDir()}`.quiet().nothrow();
-  await $`xdg-mime default ${DESKTOP} ${SCHEME}`.quiet().nothrow();
+  for (const scheme of SCHEMES) await $`xdg-mime default ${DESKTOP} ${"x-scheme-handler/" + scheme}`.quiet().nothrow();
 
   try {
     await onReady();
@@ -67,8 +73,12 @@ export async function captureCallback(timeoutMs: number, onReady: () => void | P
     }
     return undefined;
   } finally {
-    // Restore the previous handler (or clear ours) and clean up.
-    if (previous && previous !== DESKTOP) await $`xdg-mime default ${previous} ${SCHEME}`.quiet().nothrow();
+    // Restore each scheme's previous handler (or leave ours removed) and clean up.
+    for (const scheme of SCHEMES) {
+      if (previous[scheme] && previous[scheme] !== DESKTOP) {
+        await $`xdg-mime default ${previous[scheme]} ${"x-scheme-handler/" + scheme}`.quiet().nothrow();
+      }
+    }
     await Bun.file(desktopPath).delete().catch(() => {});
     await Bun.file(scriptPath).delete().catch(() => {});
     await Bun.file(callbackPath).delete().catch(() => {});
