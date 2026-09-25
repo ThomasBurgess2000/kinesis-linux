@@ -94,6 +94,7 @@ class Client {
 let dir: string;
 let daemon: Daemon | undefined;
 let clock: { now: number };
+let setSleeping: ((sleeping: boolean) => void) | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "kinesis-daemon-"));
@@ -117,6 +118,7 @@ async function startDaemon(options: { withBand?: boolean; connection?: FakeConne
     socketPath: join(dir, "run", "daemon.sock"), configPath, connection, backendFor: () => backend, log: quiet,
     pairing: options.pairing, doctor: async () => [{ name: "Test", ok: true, detail: "fine" }],
     removeFromBluez: async () => {}, clock: () => clock.now,
+    watchSleep: (onChange) => { setSleeping = onChange; return () => {}; },
   });
   await daemon.start();
   const client = await Client.open(join(dir, "run", "daemon.sock"));
@@ -218,5 +220,23 @@ test("forget clears the band, its key, and the Meta session", async () => {
   expect(after.result.enrolled).toBe(false);
   expect(await BandIdentity.exists(band.address)).toBe(false);
   expect((await client.call("getConfig")).result.band).toBeUndefined();
+  client.close();
+});
+
+test("suspend drops the band without reconnecting; resume reconnects", async () => {
+  const connection = new FakeConnection();
+  const { client } = await startDaemon({ withBand: true, connection });
+  expect(connection.active).toBe(true); // startAutomatically connected it
+  setSleeping!(true);
+  expect(connection.active).toBe(false);
+  const asleep = await client.until((e) => e.event === "state" && e.data.controller.status === "asleep");
+  expect(asleep.data.controller.phase).toBe("Computer is asleep");
+  expect(asleep.data.wantsConnection).toBe(true);
+  await Bun.sleep(1200); // longer than the first reconnect delay: still asleep, still disconnected
+  expect(connection.active).toBe(false);
+  setSleeping!(false);
+  await client.until((e) => e.event === "state" && e.data.controller.status === "reconnecting");
+  await Bun.sleep(1100);
+  expect(connection.active).toBe(true);
   client.close();
 });

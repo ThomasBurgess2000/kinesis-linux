@@ -18,7 +18,7 @@ export interface ConnectionLike {
 }
 
 /// Machine-readable connection status; `phase` is the matching human text.
-export type ControllerStatus = "disconnected" | "connecting" | "connected" | "reconnecting" | "disconnecting";
+export type ControllerStatus = "disconnected" | "connecting" | "connected" | "reconnecting" | "disconnecting" | "asleep";
 
 /// The outcome of one dispatched action (a dial turn may send it several times).
 export interface ActionResult {
@@ -69,6 +69,7 @@ export class Controller {
   private wantsConnection = false;
   private busy = false;
   private quitting = false;
+  private sleeping = false;
   private router = new GestureRouter();
   private gate = new ActionGate();
   private dialGate = new ActionGate(0);
@@ -107,7 +108,7 @@ export class Controller {
   /// Connect and keep reconnecting until disconnect() is called. Pass the enrolled identity to
   /// prove band ownership each session (without it, an enrolled band closes the input service).
   connect(band: BandDevice, options: { enableControls: boolean; enrollment?: BandEnrollmentIdentity }): void {
-    if (this.busy) return;
+    if (this.busy || this.sleeping) return;
     this.quitting = false;
     this.band = band;
     this.enrollment = options.enrollment;
@@ -123,6 +124,27 @@ export class Controller {
     this.config = config;
     if (backend) this.backend = backend;
     this.changed();
+  }
+
+  /// The computer is about to suspend: drop the link without reconnecting until wake().
+  sleep(): void {
+    if (this.sleeping) return;
+    this.sleeping = true;
+    if (this.retry) clearTimeout(this.retry);
+    this.retry = undefined;
+    this.state.live = false;
+    this.suspendActions();
+    this.setPhase("Computer is asleep", "asleep");
+    if (this.busy) this.connection.stop();
+  }
+
+  /// Back from suspend: reconnect if a connection was wanted.
+  wake(): void {
+    if (!this.sleeping) return;
+    this.sleeping = false;
+    if (this.busy) return;
+    if (this.wantsConnection && !this.quitting) this.scheduleReconnect();
+    else this.setPhase("Disconnected", "disconnected");
   }
 
   get wantsToConnect(): boolean {
@@ -238,7 +260,8 @@ export class Controller {
     this.state.handConfirmed = false;
     this.state.pendingHand = undefined;
     this.suspendActions();
-    if (this.wantsConnection && !this.quitting) this.scheduleReconnect();
+    if (this.sleeping) this.setPhase("Computer is asleep", "asleep");
+    else if (this.wantsConnection && !this.quitting) this.scheduleReconnect();
     else this.setPhase("Disconnected", "disconnected");
     this.changed();
   }

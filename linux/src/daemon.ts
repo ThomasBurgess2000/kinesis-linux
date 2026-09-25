@@ -22,6 +22,7 @@ import {
 import { BandIdentity } from "./identity";
 import { MetaSessionStore } from "./meta-auth";
 import { MetaSessionInvalidError } from "./meta-pair";
+import { watchSleep } from "./sleep";
 
 export function socketPath(): string {
   const runtime = process.env.XDG_RUNTIME_DIR || join("/tmp", `kinesis-${process.getuid?.() ?? "user"}`);
@@ -80,6 +81,8 @@ export interface DaemonOptions {
   /// Connect on start when a band is saved and `startAutomatically` is on (default true).
   autoConnect?: boolean;
   clock?: () => number;
+  /// Suspend/resume notifications (default: systemd-logind). Returns a stop function.
+  watchSleep?: (onChange: (sleeping: boolean) => void, log: Logger) => () => void;
 }
 
 type Params = Record<string, unknown>;
@@ -104,6 +107,7 @@ export class Daemon {
   private pairing: PairingState = { active: false, step: null, message: "", url: null, error: null, failedStep: null, wrongAccount: false };
   private pairingAbort: AbortController | undefined;
   private stateTimer: ReturnType<typeof setTimeout> | undefined;
+  private stopWatchingSleep: (() => void) | undefined;
 
   constructor(private readonly options: DaemonOptions = {}) {
     this.path = options.socketPath ?? socketPath();
@@ -148,10 +152,16 @@ export class Daemon {
     });
     chmodSync(this.path, 0o600);
     this.log.notice(`Kinesis daemon listening on ${this.path}`);
+    this.stopWatchingSleep = (this.options.watchSleep ?? watchSleep)((sleeping) => {
+      this.log.notice(sleeping ? "Suspending: disconnecting the band" : "Resumed");
+      if (sleeping) this.controller.sleep();
+      else this.controller.wake();
+    }, this.log);
     if ((this.options.autoConnect ?? true) && this.config.startAutomatically && this.config.band) await this.connect();
   }
 
   async stop(): Promise<void> {
+    this.stopWatchingSleep?.();
     this.pairingAbort?.abort();
     await this.controller?.disconnect();
     for (const client of this.clients) client.end();

@@ -305,6 +305,8 @@ def next_step(link: bool, state: dict) -> dict:
         return {"id": "pairing", "title": "Pairing…", "enabled": False}
     if not state.get("band") or not state.get("enrolled"):
         return {"id": "pair", "title": "Pair band…", "enabled": True}
+    if controller.get("status") == "asleep":
+        return {"id": "asleep", "title": "Computer is asleep", "enabled": False}
     if controller.get("status") == "disconnecting":
         return {"id": "disconnecting", "title": "Disconnecting…", "enabled": False}
     if not state.get("wantsConnection"):
