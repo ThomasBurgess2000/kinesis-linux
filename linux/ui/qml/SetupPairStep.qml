@@ -39,13 +39,16 @@ Item {
             spacing: Kirigami.Units.largeSpacing
             Repeater {
                 model: [{ id: "left", title: "Left wrist" }, { id: "right", title: "Right wrist" }]
+                // Not checkable: a click only asks the band. The selection always shows the daemon's
+                // pending or confirmed hand, so both can never look chosen at once.
                 delegate: QQC2.Button {
                     required property var modelData
+                    readonly property bool selected: (step.ctl.pendingHand || step.ctl.bandHand) === modelData.id
                     text: modelData.title
-                    checkable: true
-                    checked: (step.ctl.pendingHand || step.ctl.bandHand) === modelData.id
+                    icon.name: selected ? "checkmark" : ""
+                    highlighted: selected
                     enabled: step.st.canChangeHand === true
-                    onClicked: daemon.selectHand(modelData.id)
+                    onClicked: if (!selected) daemon.selectHand(modelData.id)
                 }
             }
         }

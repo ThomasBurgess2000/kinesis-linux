@@ -39,17 +39,21 @@ QQC2.ScrollView {
 
         FormCard.FormHeader { title: "Band" }
         FormCard.FormCard {
-            FormCard.FormRadioDelegate {
-                text: "Left wrist"
-                checked: bandPage.ctl.bandHand === "left"
-                enabled: bandPage.st.canChangeHand === true
-                onToggled: if (checked) daemon.selectHand("left")
-            }
-            FormCard.FormRadioDelegate {
-                text: "Right wrist"
-                checked: bandPage.ctl.bandHand !== "left"
-                enabled: bandPage.st.canChangeHand === true
-                onToggled: if (checked) daemon.selectHand("right")
+            // The checked state always follows the daemon (pending, then confirmed hand). A click
+            // only asks the band, then restores the binding the click replaced.
+            Repeater {
+                model: [{ id: "left", title: "Left wrist" }, { id: "right", title: "Right wrist" }]
+                delegate: FormCard.FormRadioDelegate {
+                    required property var modelData
+                    text: modelData.title
+                    autoExclusive: false
+                    checked: (bandPage.ctl.pendingHand || bandPage.ctl.bandHand) === modelData.id
+                    enabled: bandPage.st.canChangeHand === true
+                    onClicked: {
+                        if ((bandPage.ctl.pendingHand || bandPage.ctl.bandHand) !== modelData.id) daemon.selectHand(modelData.id);
+                        checked = Qt.binding(() => (bandPage.ctl.pendingHand || bandPage.ctl.bandHand) === modelData.id);
+                    }
+                }
             }
             FormCard.FormTextDelegate {
                 text: bandPage.ctl.pendingHand ? "Switching to your " + bandPage.ctl.pendingHand + " wrist…"
