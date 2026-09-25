@@ -2,22 +2,20 @@
 // kinesis for Linux: scan, pair, run, hand, config, actions, doctor, forget.
 
 import { parseArgs } from "node:util";
-import { ALL_ACTIONS, KdeBackend, LoggingBackend, backendFor } from "./actions";
+import { ALL_ACTIONS, LoggingBackend, backendFor } from "./actions";
 import * as bluez from "./bluez";
-import { type Config, DEFAULT_CONFIG, configPath, loadConfig, saveConfig } from "./config";
-import { canCaptureCallback, captureCallback, openInBrowser } from "./callback";
-import { OwnershipCeremony } from "./ceremony";
-import { type BandEvent } from "./gestures";
+import { type Config, ConfigError, DEFAULT_CONFIG, applyConfigPatch, configPath, loadConfig, saveConfig, settingPatch } from "./config";
 import { BandConnection, KinesisError, type Logger } from "./connection";
 import { Controller } from "./controller";
+import { Daemon, DaemonError, daemonRunning } from "./daemon";
+import { describeDevice as describe, doctorRows } from "./doctor";
+import { type PairProgress, claimBand, obtainMetaSession } from "./enroll";
 import { BandIdentity } from "./identity";
-import { MetaAuth, type MetaSession, MetaSessionStore, authEntryURL } from "./meta-auth";
-import { MetaPairClient, MetaSessionInvalidError } from "./meta-pair";
+import { MetaSessionStore } from "./meta-auth";
+import { MetaSessionInvalidError } from "./meta-pair";
 import {
-  ACTION_TITLES, type BandDevice, type BandHand, DIAL_TARGETS, type DialTarget, SWIPE_DIRECTIONS, TAP_GESTURES,
-  isAction, recognizedLabel,
+  ACTION_TITLES, type BandDevice, type BandHand, SWIPE_DIRECTIONS, TAP_GESTURES, isAction, recognizedLabel,
 } from "./gestures";
-import { AF_BLUETOOTH, BTPROTO_L2CAP, SOCK_SEQPACKET, libc } from "./l2cap";
 
 const USAGE = `kinesis — use your Meta Neural Band to control Linux
 
@@ -26,6 +24,7 @@ usage:
   kinesis enroll [--login] [--verbose]            claim the band to your Meta account (needed once, for stable sessions)
   kinesis pair [ADDRESS]                          bond through BlueZ (only if your firmware asks for it)
   kinesis run [--practice] [--verbose]            connect and enable controls (--practice only prints)
+  kinesis daemon                                  run in the background for the tray app (see packaging/)
   kinesis hand left|right                         write the band's hand setting and confirm it
   kinesis config [get KEY | set KEY VALUE | path] show or change settings
   kinesis actions [--test ACTION]                 list actions and their support; test one
@@ -53,9 +52,11 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-function describe(device: BandDevice, scanning = false): string {
-  const signal = device.rssi !== undefined ? `  rssi ${device.rssi}` : scanning ? "  (not advertising)" : "";
-  return `${device.name || "Meta Band"}  ${device.address}  ${device.addressType}${signal}`;
+/// The daemon owns the band while it runs; commands that connect would fight it for the link.
+async function requireNoDaemon(): Promise<void> {
+  if (await daemonRunning()) {
+    fail("The Kinesis app's background service is using the band. Use the app, or stop it first:\n  systemctl --user stop kinesis.service");
+  }
 }
 
 async function scan(args: string[]): Promise<void> {
@@ -98,6 +99,7 @@ function savedBand(config: Config): BandDevice {
 
 async function run(args: string[]): Promise<void> {
   const { values } = parseArgs({ args, options: { practice: { type: "boolean", default: false }, verbose: { type: "boolean", default: false } } });
+  await requireNoDaemon();
   const config = await loadConfig();
   const band = savedBand(config);
   const log = logger(values.verbose);
@@ -116,6 +118,7 @@ async function run(args: string[]): Promise<void> {
       }
     },
     onGesture: (gesture) => console.log(`${stamp()} gesture: ${recognizedLabel(gesture)}`),
+    onAction: (result) => console.log(`${stamp()} ${result.ok ? "Sent" : "Failed"}: ${result.title}${result.count > 1 ? ` ×${result.count}` : ""}`),
     onHandConfirmed: async (hand) => {
       console.log(`${stamp()} band hand: ${hand}`);
       if (config.hand !== hand) { config.hand = hand; await saveConfig(config); }
@@ -129,13 +132,6 @@ async function run(args: string[]): Promise<void> {
       }
     },
   });
-  const onAction = setInterval(() => {
-    const action = controller.state.lastAction;
-    if (action.startsWith("Sent") || action.startsWith("Failed")) {
-      if (action !== lastAction) { lastAction = action; console.log(`${stamp()} ${action}`); }
-    }
-  }, 50);
-  let lastAction = "";
   const enrollment = await BandIdentity.enrollment(band.address);
   if (enrollment) console.log(`${stamp()} using enrolled band identity (${BandIdentity.path(band.address)})`);
   else console.warn(`${stamp()} no enrolled identity for this band; the session may last only ~30 s. Run \`kinesis enroll\` for a stable connection.`);
@@ -143,7 +139,6 @@ async function run(args: string[]): Promise<void> {
   controller.connect(band, { enableControls: true, ...(enrollment ? { enrollment } : {}) });
   const shutdown = async () => {
     console.log("");
-    clearInterval(onAction);
     await controller.disconnect();
     process.exit(0);
   };
@@ -152,117 +147,51 @@ async function run(args: string[]): Promise<void> {
   await new Promise(() => {});
 }
 
-/// Obtain a Meta account session: reuse a saved one, or run the webview sign-in. The user signs
-/// in on Meta's own page in their browser and pastes back the fb-viewapp:// callback URL; this
-/// client only ever sees the returned blob, never the password.
-async function obtainMetaSession(forceLogin: boolean): Promise<MetaSession> {
-  if (!forceLogin) {
-    const saved = await MetaSessionStore.restore();
-    if (saved) { console.log("Using saved Meta account session."); return saved; }
-  }
-  const tokens = await MetaAuth.tokensQuery();
-  const url = authEntryURL(tokens);
-  let callback: string | undefined;
-  if (canCaptureCallback()) {
-    console.log("\nA browser will open Meta's sign-in page. Sign in there; the callback is captured");
-    console.log("automatically (a temporary handler for the oculus:// and fb-viewapp:// schemes, removed afterward).");
-    console.log("\nIf the browser doesn't open, paste this URL into it manually:\n\n  " + url + "\n");
-    callback = await captureCallback(180_000, async () => {
-      if (!(await openInBrowser(url))) console.log("(couldn't launch a browser automatically — open the URL above)");
-    });
-    if (!callback) console.log("\nDidn't capture the callback automatically.");
-  } else {
-    console.log("\nOpen this URL in your browser and sign in to your Meta account:\n\n  " + url + "\n");
-  }
-  if (!callback) {
-    console.log("After signing in, the page redirects to a URL like `oculus://frl_login/?...` (or `fb-viewapp://`).");
-    console.log("If you can copy that URL, paste it here; otherwise press enter to cancel.\n");
-    callback = (prompt("Paste the oculus:// (or fb-viewapp://) callback URL (or enter to cancel):") ?? "").trim();
-  }
-  if (!callback) throw new KinesisError("No callback captured. Run `kinesis enroll` again.");
-  const { token, blob } = MetaAuth.parseCallback(callback);
-  if (!blob || !MetaAuth.callbackMatches(token, tokens.nativeSSOToken)) {
-    throw new KinesisError("That callback URL didn't match this sign-in. Start `kinesis enroll` again.");
-  }
-  const frl = await MetaAuth.decryptBlob(blob, tokens.nativeSSOToken);
-  const session = await MetaAuth.login(frl);
-  await MetaSessionStore.save(session);
-  console.log(`Signed in as Meta user ${session.userID}. Session saved to ${MetaSessionStore.path()}.`);
-  return session;
-}
-
 async function enroll(args: string[]): Promise<void> {
   const { values } = parseArgs({ args, options: { login: { type: "boolean", default: false }, verbose: { type: "boolean", default: false } } });
+  await requireNoDaemon();
   const config = await loadConfig();
   const band = savedBand(config);
   const log = logger(values.verbose);
   if (await BandIdentity.exists(band.address)) {
     console.log(`This band already has an enrolled identity (${BandIdentity.path(band.address)}). Re-enrolling replaces it.`);
   }
-  const session = await obtainMetaSession(values.login);
-  const pairClient = new MetaPairClient(session);
-  console.log("\nPut the band in pairing mode (press its button) and keep it on your wrist.");
-
-  // Transient BLE failures (aborted connects, short-window timeouts) are worth retrying; the band
-  // advertises again after each. A ceremony/HTTP/auth failure is terminal.
-  const isTransient = (message: string): boolean =>
-    /abort-by-local|took too long|isn't connected or advertising|stream failed|stream ended|services never resolved/i.test(message);
-
-  // Once the band confirms the ownership change it belongs to that key; later attempts reconnect
-  // with it through the enrolled trust flow instead of claiming the band again with a new key.
-  let savedEarly: import("./identity").BandEnrollmentIdentity | undefined;
-  for (let attempt = 1; attempt <= 12; attempt++) {
-    const connection = new BandConnection(log);
-    const claimed = savedEarly;
-    const sessionOptions = claimed
-      ? { configChannel: config.configChannel, enrollment: claimed }
-      : { configChannel: config.configChannel, ceremony: new OwnershipCeremony(band.address) };
-    if (claimed) console.log(`${stamp()} reconnecting with the new identity to finish trust`);
-    let identity: import("./identity").BandEnrollmentIdentity | undefined;
-    const outcome = await new Promise<Error | undefined>((resolve) => {
-      connection.start(
-        { kind: "connect", band, security: config.security, session: sessionOptions, bond: config.bond, directL2cap: config.directL2cap, psm: config.psm, pairClient },
-        (event: BandEvent) => {
-          if (event.payload.type === "ceremonyStage") console.log(`${stamp()} enrollment: ${event.payload.message}`);
-          // The band now belongs to the new key. Save it before the trust step, so a failure there
-          // leaves a reconnectable identity instead of a band owned by a discarded key.
-          const adopted = connection.enrolled;
-          if (adopted && adopted !== savedEarly) {
-            savedEarly = adopted;
-            BandIdentity.save(adopted, band.address)
-              .then(() => console.log(`${stamp()} band claimed; identity saved to ${BandIdentity.path(band.address)}`))
-              .catch((error: unknown) => console.error(`${stamp()} couldn't save the new identity: ${error instanceof Error ? error.message : error}`));
-          }
-          if (event.payload.type === "connected") {
-            identity = connection.enrolled ?? claimed;
-            connection.stop();
-          }
-        },
-        (error) => resolve(error),
-      ).catch((error: unknown) => resolve(error instanceof Error ? error : new Error(String(error))));
-    });
-
-    if (identity) {
-      await BandIdentity.save(identity, band.address);
-      console.log(`\nEnrolled and streaming. Identity saved to ${BandIdentity.path(band.address)}.`);
-      console.log("Done. Run `kinesis run` for a stable, auto-reconnecting session.");
-      return;
+  let shownURL = false;
+  const onProgress = (progress: PairProgress) => {
+    if (progress.url && !shownURL) {
+      shownURL = true;
+      console.log(`\nIf the browser doesn't open, paste this URL into it:\n\n  ${progress.url}\n`);
     }
-    if (outcome instanceof MetaSessionInvalidError) {
+    console.log(`${stamp()} ${progress.message}`);
+  };
+  try {
+    const session = await obtainMetaSession({
+      forceLogin: values.login,
+      onProgress,
+      askForCallback: async () => {
+        console.log("\nDidn't capture the sign-in callback automatically. After signing in, the page redirects to a");
+        console.log("URL like `oculus://frl_login/?...` (or `fb-viewapp://`). Paste it here, or press enter to cancel.\n");
+        return prompt("Callback URL:") ?? undefined;
+      },
+    });
+    console.log(`Signed in as Meta user ${session.userID}.`);
+    console.log("\nPut the band in pairing mode (press its button) and keep it on your wrist.");
+    await claimBand({ band, config, session, log, onProgress });
+  } catch (error) {
+    if (error instanceof MetaSessionInvalidError) {
       await MetaSessionStore.delete();
       fail("Your Meta session expired. Run `kinesis enroll --login` to sign in again.");
     }
-    const message = outcome?.message ?? "the connection closed before enrollment finished";
-    if (!isTransient(message)) fail(`Enrollment failed: ${message}`);
-    console.log(`${stamp()} ${message}; retrying (${attempt}/12)…`);
-    await Bun.sleep(1500);
+    throw error;
   }
-  fail("Couldn't hold a connection to the band long enough to enroll. Keep it in pairing mode and try again.");
+  console.log(`\nEnrolled and streaming. Identity saved to ${BandIdentity.path(band.address)}.`);
+  console.log("Done. Run `kinesis run` (or the app) for a stable, auto-reconnecting session.");
 }
 
 async function hand(args: string[]): Promise<void> {
   const requested = args[0];
   if (requested !== "left" && requested !== "right") fail("usage: kinesis hand left|right");
+  await requireNoDaemon();
   const config = await loadConfig();
   const band = savedBand(config);
   const log = logger(false);
@@ -316,47 +245,16 @@ async function configCommand(args: string[]): Promise<void> {
   }
   if (verb !== "set" || !key) fail("usage: kinesis config [get KEY | set KEY VALUE | reset | path]");
   const value = rest.join(" ");
-  const [group, name] = key.split(".") as [string, string | undefined];
-  const requireAction = (): Config["swipes"]["left"] => {
-    if (!isAction(value)) fail(`Unknown action "${value}". Options: ${ALL_ACTIONS.join(", ")}`);
-    return value;
-  };
-  if (group === "swipes" && (SWIPE_DIRECTIONS as readonly string[]).includes(name ?? "")) {
-    config.swipes[name as (typeof SWIPE_DIRECTIONS)[number]] = requireAction();
-  } else if (group === "taps" && (TAP_GESTURES as readonly string[]).includes(name ?? "")) {
-    config.taps[name as (typeof TAP_GESTURES)[number]] = requireAction();
-  } else if (group === "dial" && name === "target") {
-    if (!(DIAL_TARGETS as readonly string[]).includes(value)) fail(`dial.target must be one of ${DIAL_TARGETS.join(", ")}`);
-    config.dial.target = value as DialTarget;
-  } else if (group === "dial" && name === "sensitivity") {
-    const sensitivity = Number(value);
-    if (!(sensitivity >= 0.5 && sensitivity <= 4)) fail("dial.sensitivity must be between 0.5 and 4");
-    config.dial.sensitivity = sensitivity;
-  } else if (group === "backend" && !name) {
-    if (value !== "auto" && value !== "kde" && value !== "command") fail("backend must be auto, kde, or command");
-    config.backend = value;
-  } else if (group === "security" && !name) {
-    if (value !== "low" && value !== "medium" && value !== "high") fail("security must be low, medium, or high");
-    config.security = value;
-  } else if (group === "linkSetup" && !name) {
-    if (value !== "pipelined" && value !== "phased") fail("linkSetup must be pipelined or phased");
-    config.linkSetup = value;
-  } else if (group === "configChannel" && !name) {
-    const channel = value.startsWith("0x") ? parseInt(value, 16) : Number(value);
-    if (!Number.isInteger(channel) || channel <= 0 || channel > 0xffff) fail("configChannel must be a 16-bit number, e.g. 0x8006 or 0x8007");
-    config.configChannel = channel;
-  } else if (group === "commands" && name) {
-    if (!isAction(name)) fail(`Unknown action "${name}"`);
-    let argv: unknown;
-    try { argv = JSON.parse(value); } catch { fail("commands.<action> takes a JSON array, e.g. '[\"xdotool\",\"key\",\"Escape\"]'"); }
-    if (!Array.isArray(argv) || !argv.every((a) => typeof a === "string")) fail("commands.<action> must be an array of strings");
-    if (argv.length === 0) delete config.commands[name];
-    else config.commands[name] = argv;
-  } else {
-    fail(`Unknown setting "${key}"`);
+  let next: Config;
+  try {
+    next = applyConfigPatch(config, settingPatch(key, value));
+  } catch (error) {
+    if (error instanceof ConfigError) fail(error.message.startsWith("Unknown action") ? `${error.message}. Options: ${ALL_ACTIONS.join(", ")}` : error.message);
+    throw error;
   }
-  await saveConfig(config);
+  await saveConfig(next);
   console.log(`${key} = ${JSON.stringify(value)}`);
+  if (await daemonRunning()) console.log("(the app's background service picks up changes on restart: systemctl --user restart kinesis.service)");
 }
 
 async function actions(args: string[]): Promise<void> {
@@ -383,43 +281,26 @@ async function actions(args: string[]): Promise<void> {
 }
 
 async function doctor(): Promise<void> {
-  const rows: [string, boolean, string][] = [];
-  const check = (name: string, ok: boolean, detail = "") => rows.push([name, ok, detail]);
+  const rows = await doctorRows();
+  for (const { name, ok, detail } of rows) console.log(`  ${ok ? "✓" : "✗"} ${name.padEnd(22)} ${detail}`);
+  if (rows.some((row) => !row.ok)) process.exitCode = 1;
+}
+
+async function daemon(): Promise<void> {
+  const instance = new Daemon();
   try {
-    const adapter = await bluez.adapterPath();
-    check("BlueZ adapter", true, adapter);
+    await instance.start();
   } catch (error) {
-    check("BlueZ adapter", false, error instanceof Error ? error.message : String(error));
+    if (error instanceof DaemonError) fail(error.message);
+    throw error;
   }
-  const fd = libc.symbols.socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
-  check("L2CAP socket", fd >= 0, fd >= 0 ? "kernel allows AF_BLUETOOTH sockets" : "socket() failed; check bluetooth kernel modules");
-  if (fd >= 0) libc.symbols.close(fd);
-  check("busctl", Bun.which("busctl") !== null, Bun.which("busctl") ?? "install systemd");
-  const desktop = process.env.XDG_CURRENT_DESKTOP ?? "";
-  check("Desktop", desktop.length > 0, `${desktop || "unknown"} on ${process.env.XDG_SESSION_TYPE ?? "unknown session"}`);
-  check("KDE backend", KdeBackend.available(), KdeBackend.available() ? "qdbus found" : "not KDE or qdbus missing; use the command backend");
-  const ydotool = Bun.which("ydotool");
-  check("ydotool", ydotool !== null, ydotool ? "used for Escape and tab switching" : "optional; needed for dismiss/previousTab/nextTab on KDE");
-  const config = await loadConfig();
-  check("Saved band", config.band !== undefined, config.band ? describe(config.band) : "run `kinesis scan`");
-  if (config.band) {
-    const known = await bluez.knownDevice(config.band.address).catch(() => undefined);
-    check("Band known to BlueZ", known !== undefined, known ? describe(known) : "run `kinesis scan` with the band in pairing mode");
-    if (known) {
-      const adapter = await bluez.adapterPath();
-      const state = await bluez.deviceState(bluez.devicePath(adapter, known.address)).catch(() => undefined);
-      if (state) check("Band state", true, `connected ${state.connected}, paired ${state.paired}, trusted ${state.trusted}`);
-    }
-  }
-  if (config.band) {
-    const enrolled = await BandIdentity.exists(config.band.address);
-    check("Band enrollment", enrolled, enrolled ? BandIdentity.path(config.band.address) : "run `kinesis enroll` for stable sessions");
-  }
-  const metaSession = await MetaSessionStore.restore();
-  check("Meta session", metaSession !== undefined, metaSession ? `user ${metaSession.userID}` : "run `kinesis enroll` (sign in once)");
-  check("Config", true, configPath());
-  for (const [name, ok, detail] of rows) console.log(`  ${ok ? "✓" : "✗"} ${name.padEnd(20)} ${detail}`);
-  if (rows.some(([, ok]) => !ok)) process.exitCode = 1;
+  const shutdown = async () => {
+    await instance.stop();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
+  await new Promise(() => {});
 }
 
 async function forget(): Promise<void> {
@@ -443,6 +324,7 @@ async function main(): Promise<void> {
       case "enroll": return await enroll(args);
       case "pair": return await pair(args);
       case "run": return await run(args);
+      case "daemon": return await daemon();
       case "hand": return await hand(args);
       case "config": return await configCommand(args);
       case "actions": return await actions(args);

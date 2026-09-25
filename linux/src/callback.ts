@@ -33,9 +33,9 @@ export async function openInBrowser(url: string): Promise<boolean> {
   return result.exitCode === 0;
 }
 
-/// Register the temporary handler, run `body` (which triggers the sign-in), and resolve with the
-/// captured callback URL, or undefined on timeout. Always restores the previous handler.
-export async function captureCallback(timeoutMs: number, onReady: () => void | Promise<void>): Promise<string | undefined> {
+/// Register the temporary handler, run `onReady` (which triggers the sign-in), and resolve with the
+/// captured callback URL, or undefined on timeout or abort. Always restores the previous handler.
+export async function captureCallback(timeoutMs: number, onReady: () => void | Promise<void>, signal?: AbortSignal): Promise<string | undefined> {
   const dir = stateDir();
   const scriptPath = join(dir, "fb-viewapp-handler.sh");
   const callbackPath = join(dir, "enroll-callback.url");
@@ -63,7 +63,7 @@ export async function captureCallback(timeoutMs: number, onReady: () => void | P
   try {
     await onReady();
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !signal?.aborted) {
       const file = Bun.file(callbackPath);
       if (await file.exists()) {
         const url = (await file.text()).trim();

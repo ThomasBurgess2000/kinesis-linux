@@ -17,11 +17,26 @@ export interface ConnectionLike {
   setHandedness(hand: BandHand): void;
 }
 
+/// Machine-readable connection status; `phase` is the matching human text.
+export type ControllerStatus = "disconnected" | "connecting" | "connected" | "reconnecting" | "disconnecting";
+
+/// The outcome of one dispatched action (a dial turn may send it several times).
+export interface ActionResult {
+  action: Action;
+  title: string;
+  count: number;
+  ok: boolean;
+  error?: string;
+}
+
 export interface ControllerState {
   phase: string;
+  status: ControllerStatus;
   live: boolean;
   controlsEnabled: boolean;
   battery: number | undefined;
+  /// From the in-band battery status; undefined when the band doesn't say.
+  charging: boolean | undefined;
   bandHand: BandHand;
   handConfirmed: boolean;
   pendingHand: BandHand | undefined;
@@ -38,6 +53,7 @@ export interface ControllerHooks {
   onState?(state: ControllerState): void;
   onGesture?(gesture: RecognizedGesture): void;
   onDial?(delta: number): void;
+  onAction?(result: ActionResult): void;
   onHandConfirmed?(hand: BandHand): void;
   /// BlueZ resolved the band's current identity (address may differ from the one saved at scan time).
   onBandResolved?(device: BandDevice): void;
@@ -45,7 +61,8 @@ export interface ControllerHooks {
 
 export class Controller {
   readonly state: ControllerState = {
-    phase: "Disconnected", live: false, controlsEnabled: false, battery: undefined, bandHand: "right",
+    phase: "Disconnected", status: "disconnected", live: false, controlsEnabled: false, battery: undefined,
+    charging: undefined, bandHand: "right",
     handConfirmed: false, pendingHand: undefined, handSettingError: undefined, lastGesture: "Waiting for a gesture",
     lastAction: "Controls are paused", gestureCount: 0, dialEngaged: false, pinchedFinger: undefined, error: undefined,
   };
@@ -68,9 +85,9 @@ export class Controller {
   private enrollment: BandEnrollmentIdentity | undefined;
 
   constructor(
-    private readonly config: Config,
+    private config: Config,
     private readonly connection: ConnectionLike,
-    private readonly backend: ActionBackend,
+    private backend: ActionBackend,
     private readonly log: Logger,
     private readonly hooks: ControllerHooks = {},
     private readonly clock: () => number = now,
@@ -90,7 +107,8 @@ export class Controller {
   /// Connect and keep reconnecting until disconnect() is called. Pass the enrolled identity to
   /// prove band ownership each session (without it, an enrolled band closes the input service).
   connect(band: BandDevice, options: { enableControls: boolean; enrollment?: BandEnrollmentIdentity }): void {
-    if (this.busy || this.quitting) return;
+    if (this.busy) return;
+    this.quitting = false;
     this.band = band;
     this.enrollment = options.enrollment;
     this.wantsConnection = true;
@@ -98,6 +116,17 @@ export class Controller {
     this.retries = 0;
     this.ticker ??= setInterval(() => this.tick(), 500);
     this.run(this.connectOperation(band));
+  }
+
+  /// Apply edited settings (mappings, dial) to the running session without reconnecting.
+  updateConfig(config: Config, backend?: ActionBackend): void {
+    this.config = config;
+    if (backend) this.backend = backend;
+    this.changed();
+  }
+
+  get wantsToConnect(): boolean {
+    return this.wantsConnection;
   }
 
   async disconnect(): Promise<void> {
@@ -109,7 +138,7 @@ export class Controller {
     this.state.live = false;
     this.state.handConfirmed = false;
     this.state.pendingHand = undefined;
-    this.setPhase(this.busy ? "Disconnecting…" : "Disconnected");
+    this.setPhase(this.busy ? "Disconnecting…" : "Disconnected", this.busy ? "disconnecting" : "disconnected");
     this.connection.stop();
     const deadline = Date.now() + 8000;
     while (this.busy && Date.now() < deadline) await Bun.sleep(100);
@@ -158,9 +187,10 @@ export class Controller {
     this.changed();
   }
 
-  private setPhase(phase: string): void {
-    if (this.state.phase !== phase) {
+  private setPhase(phase: string, status: ControllerStatus): void {
+    if (this.state.phase !== phase || this.state.status !== status) {
       this.state.phase = phase;
+      this.state.status = status;
       this.changed();
     }
   }
@@ -186,7 +216,7 @@ export class Controller {
     if (this.busy) return;
     this.busy = true;
     this.state.error = undefined;
-    this.setPhase("Preparing…");
+    this.setPhase("Preparing…", "connecting");
     this.state.live = false;
     this.heartbeat = undefined;
     this.state.handConfirmed = false;
@@ -209,7 +239,7 @@ export class Controller {
     this.state.pendingHand = undefined;
     this.suspendActions();
     if (this.wantsConnection && !this.quitting) this.scheduleReconnect();
-    else this.setPhase("Disconnected");
+    else this.setPhase("Disconnected", "disconnected");
     this.changed();
   }
 
@@ -223,6 +253,13 @@ export class Controller {
       case "battery":
         this.state.battery = payload.percent;
         this.changed();
+        break;
+      case "batteryStatus":
+        if (payload.status) {
+          this.state.battery = payload.status.level;
+          this.state.charging = payload.status.charging;
+          this.changed();
+        }
         break;
       case "handedness":
         if (!this.wantsConnection) return;
@@ -240,10 +277,10 @@ export class Controller {
         this.changed();
         break;
       case "preparing":
-        this.setPhase("Preparing…");
+        this.setPhase("Preparing…", "connecting");
         break;
       case "connected":
-        this.setPhase("Connected");
+        this.setPhase("Connected", "connected");
         this.retries = 0;
         this.state.error = undefined;
         if (this.state.controlsEnabled) this.gate.arm(time);
@@ -324,7 +361,7 @@ export class Controller {
     this.heartbeat = this.clock();
     let changed = false;
     if (!this.state.live) { this.state.live = true; changed = true; }
-    if (this.state.phase !== "Connected") { this.state.phase = "Connected"; changed = true; }
+    if (this.state.phase !== "Connected") { this.state.phase = "Connected"; this.state.status = "connected"; changed = true; }
     if (this.enableWhenLive) this.enableControls();
     else if (changed) this.changed();
   }
@@ -335,7 +372,7 @@ export class Controller {
     // Retry quickly: the band advertises continuously, and we want to catch its brief connectable
     // window right after a button press rather than backing off away from it.
     const delay = Math.min(this.retries, 2);
-    this.setPhase(`Reconnecting in ${delay}s…`);
+    this.setPhase(`Reconnecting in ${delay}s…`, "reconnecting");
     this.retry = setTimeout(() => {
       this.retry = undefined;
       if (!this.wantsConnection || this.quitting || !this.band) return;
@@ -344,15 +381,18 @@ export class Controller {
   }
 
   private async dispatch(action: Action, count = 1): Promise<void> {
+    const title = ACTION_TITLES[action];
     try {
       for (let i = 0; i < count; i++) await this.backend.post(action);
-      this.state.lastAction = `Sent: ${ACTION_TITLES[action]}${count > 1 ? ` ×${count}` : ""}`;
+      this.state.lastAction = `Sent: ${title}${count > 1 ? ` ×${count}` : ""}`;
+      this.hooks.onAction?.({ action, title, count, ok: true });
       this.changed();
     } catch (error) {
       // One failing action shouldn't take controls down; report it and keep listening.
       const message = error instanceof Error ? error.message : String(error);
-      this.state.lastAction = `Failed: ${ACTION_TITLES[action]}`;
-      this.log.error(`${ACTION_TITLES[action]}: ${message}`);
+      this.state.lastAction = `Failed: ${title}`;
+      this.log.error(`${title}: ${message}`);
+      this.hooks.onAction?.({ action, title, count, ok: false, error: message });
       this.changed();
     }
   }
@@ -370,7 +410,7 @@ export class Controller {
       if (this.state.live) {
         this.state.live = false;
         this.suspendActions();
-        this.setPhase("Connection stalled. Reconnecting…");
+        this.setPhase("Connection stalled. Reconnecting…", "reconnecting");
         this.log.notice(`No band input for ${silentFor.toFixed(1)}s; reconnecting`);
       }
       this.connection.stop();

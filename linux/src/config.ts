@@ -23,6 +23,10 @@ export interface Config {
   bond: boolean;
   directL2cap: boolean;
   psm: number;
+  /// The app's first-run setup has been finished or skipped.
+  setupDone: boolean;
+  /// The daemon connects and enables controls as soon as it starts.
+  startAutomatically: boolean;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -37,6 +41,8 @@ export const DEFAULT_CONFIG: Config = {
   bond: false, // not needed: the ~37 s stalls were the kernel credit-ident bug (see kernel-fix/)
   directL2cap: true,
   psm: 255,
+  setupDone: false,
+  startAutomatically: true,
 };
 
 export function configPath(): string {
@@ -86,7 +92,114 @@ export function normalize(raw: unknown): Config {
   if (typeof raw.bond === "boolean") config.bond = raw.bond;
   if (typeof raw.directL2cap === "boolean") config.directL2cap = raw.directL2cap;
   if (typeof raw.psm === "number" && Number.isInteger(raw.psm) && raw.psm > 0 && raw.psm <= 0xffff) config.psm = raw.psm;
+  if (typeof raw.setupDone === "boolean") config.setupDone = raw.setupDone;
+  if (typeof raw.startAutomatically === "boolean") config.startAutomatically = raw.startAutomatically;
   return config;
+}
+
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigError";
+  }
+}
+
+/// Apply a partial settings object (e.g. `{ swipes: { left: "mute" }, dial: { sensitivity: 2 } }`)
+/// to a copy of `config`. Unlike normalize(), anything invalid is an error the caller reports, so
+/// the CLI's `config set` and the app's settings share one set of rules and messages.
+export function applyConfigPatch(config: Config, patch: unknown): Config {
+  if (!isRecord(patch)) throw new ConfigError("Settings must be an object");
+  const next: Config = structuredClone(config);
+  const requireAction = (value: unknown): Action => {
+    if (!isAction(value)) throw new ConfigError(`Unknown action "${String(value)}"`);
+    return value;
+  };
+  for (const [key, value] of Object.entries(patch)) {
+    switch (key) {
+      case "swipes":
+      case "taps": {
+        if (!isRecord(value)) throw new ConfigError(`${key} must be an object`);
+        const names: readonly string[] = key === "swipes" ? SWIPE_DIRECTIONS : TAP_GESTURES;
+        for (const [name, action] of Object.entries(value)) {
+          if (!names.includes(name)) throw new ConfigError(`Unknown setting "${key}.${name}"`);
+          (next[key] as Record<string, Action>)[name] = requireAction(action);
+        }
+        break;
+      }
+      case "dial": {
+        if (!isRecord(value)) throw new ConfigError("dial must be an object");
+        for (const [name, v] of Object.entries(value)) {
+          if (name === "target") {
+            if (!(DIAL_TARGETS as readonly unknown[]).includes(v)) throw new ConfigError(`dial.target must be one of ${DIAL_TARGETS.join(", ")}`);
+            next.dial.target = v as DialTarget;
+          } else if (name === "sensitivity") {
+            if (typeof v !== "number" || !(v >= 0.5 && v <= 4)) throw new ConfigError("dial.sensitivity must be between 0.5 and 4");
+            next.dial.sensitivity = v;
+          } else {
+            throw new ConfigError(`Unknown setting "dial.${name}"`);
+          }
+        }
+        break;
+      }
+      case "backend":
+        if (value !== "auto" && value !== "kde" && value !== "command") throw new ConfigError("backend must be auto, kde, or command");
+        next.backend = value;
+        break;
+      case "security":
+        if (value !== "low" && value !== "medium" && value !== "high") throw new ConfigError("security must be low, medium, or high");
+        next.security = value;
+        break;
+      case "linkSetup":
+        if (value !== "pipelined" && value !== "phased") throw new ConfigError("linkSetup must be pipelined or phased");
+        next.linkSetup = value;
+        break;
+      case "configChannel":
+        if (typeof value !== "number" || !Number.isInteger(value) || value <= 0 || value > 0xffff) {
+          throw new ConfigError("configChannel must be a 16-bit number, e.g. 0x8006 or 0x8007");
+        }
+        next.configChannel = value;
+        break;
+      case "commands": {
+        if (!isRecord(value)) throw new ConfigError("commands must be an object");
+        for (const [name, argv] of Object.entries(value)) {
+          if (!isAction(name)) throw new ConfigError(`Unknown action "${name}"`);
+          if (!Array.isArray(argv) || !argv.every((a) => typeof a === "string")) {
+            throw new ConfigError("commands.<action> must be an array of strings");
+          }
+          if (argv.length === 0) delete next.commands[name];
+          else next.commands[name] = argv;
+        }
+        break;
+      }
+      case "bond":
+      case "directL2cap":
+      case "setupDone":
+      case "startAutomatically":
+        if (typeof value !== "boolean") throw new ConfigError(`${key} must be true or false`);
+        next[key] = value;
+        break;
+      default:
+        throw new ConfigError(`Unknown setting "${key}"`);
+    }
+  }
+  return next;
+}
+
+/// Turn the CLI's `config set KEY VALUE` into a patch for applyConfigPatch().
+export function settingPatch(key: string, value: string): Record<string, unknown> {
+  const [group, name, ...extra] = key.split(".");
+  if (!group || extra.length) throw new ConfigError(`Unknown setting "${key}"`);
+  let parsed: unknown = value;
+  if (group === "commands") {
+    try { parsed = JSON.parse(value); } catch { throw new ConfigError("commands.<action> takes a JSON array, e.g. '[\"xdotool\",\"key\",\"Escape\"]'"); }
+  } else if (group === "dial" && name === "sensitivity") {
+    parsed = Number(value);
+  } else if (group === "configChannel") {
+    parsed = value.startsWith("0x") ? parseInt(value, 16) : Number(value);
+  } else if (["bond", "directL2cap", "setupDone", "startAutomatically"].includes(group)) {
+    parsed = value === "true" ? true : value === "false" ? false : value;
+  }
+  return name === undefined ? { [group]: parsed } : { [group]: { [name]: parsed } };
 }
 
 export async function loadConfig(path = configPath()): Promise<Config> {

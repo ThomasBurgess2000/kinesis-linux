@@ -126,16 +126,19 @@ export async function discoverBand(saved: BandDevice, seconds: number): Promise<
   // Remove every cached Meta Band object first. Each button press makes the band advertise a new
   // resolvable-private address, and BlueZ keeps the old objects with a stale RSSI; picking one of
   // those connects to an address the band no longer uses and times out. After removal, only the
-  // address the band is advertising *right now* reappears. A bonded band is kept: removing it
-  // erases the pairing keys, and the band drops unbonded links after ~30 s.
+  // address the band is advertising *right now* reappears. A bonded band is kept (removing it
+  // erases the pairing keys the band asks for on connect), but its object keeps the RSSI of an
+  // old sighting, so it only counts once that RSSI changes: BlueZ has then resolved the band's
+  // current address from a fresh advertisement and a connect goes to the live address.
+  const staleRssi = new Map<string, number | undefined>();
   for (const [path, ifaces] of await objects()) {
     if (!path.startsWith(adapter + "/dev_")) continue;
     const props = ifaces.get("org.bluez.Device1");
     const device = props && deviceFrom(props);
-    const bonded = props !== undefined && (getBoolean(props, "Paired") === true || getBoolean(props, "Bonded") === true);
-    if (device && isBandName(device.name) && !bonded) {
-      await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "RemoveDevice", "o", path], 10).catch(() => {});
-    }
+    if (!device || !isBandName(device.name)) continue;
+    const bonded = getBoolean(props, "Paired") === true || getBoolean(props, "Bonded") === true;
+    if (bonded) staleRssi.set(path, device.rssi);
+    else await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "RemoveDevice", "o", path], 10).catch(() => {});
   }
   holdDiscovery(seconds + 5);
   try {
@@ -148,9 +151,11 @@ export async function discoverBand(saved: BandDevice, seconds: number): Promise<
         if (!path.startsWith(adapter + "/dev_")) continue;
         const props = ifaces.get("org.bluez.Device1");
         const device = props && deviceFrom(props);
-        if (device && isBandName(device.name) && device.rssi !== undefined) candidates.push({ path, device });
+        if (!device || !isBandName(device.name) || device.rssi === undefined) continue;
+        if (staleRssi.has(path) && staleRssi.get(path) === device.rssi) continue; // not seen yet
+        candidates.push({ path, device });
       }
-      // Freshly re-discovered after the purge above, so the strongest signal is the live one.
+      // Freshly (re-)discovered, so the strongest signal is the live one.
       const chosen = candidates.sort((a, b) => (b.device.rssi ?? -127) - (a.device.rssi ?? -127))[0];
       if (chosen) {
         await releaseDiscovery();
