@@ -8,6 +8,10 @@ if pgrep -f "^$PWD/dist/Kinesis.app/Contents/MacOS/Kinesis$" >/dev/null; then
 fi
 
 build_args=(-c release --arch arm64 --arch x86_64 -Xswiftc -warnings-as-errors)
+# --dev (or KINESIS_DEV=1) makes a dev build: the same app with experiments and
+# developer tools compiled in, such as the practice lab. Releases leave them out.
+if [ "${1:-}" = --dev ]; then KINESIS_DEV=1; fi
+if [ "${KINESIS_DEV:-}" = 1 ]; then build_args+=(-Xswiftc -DKINESIS_DEV); fi
 binary_dir=$(swift build "${build_args[@]}" --show-bin-path)
 # SwiftPM can retain removed resources in an existing bundle.
 if [ -d "$binary_dir/Kinesis_Kinesis.bundle" ]; then
@@ -33,6 +37,7 @@ mkdir -p "$staged_app/Contents/MacOS" "$staged_app/Contents/Resources"
 cp "$binary_dir/Kinesis" "$staged_app/Contents/MacOS/Kinesis"
 cp -R "$binary_dir/Kinesis_Kinesis.bundle" "$staged_app/Contents/Resources/"
 cp Packaging/Info.plist "$staged_app/Contents/Info.plist"
+cp LICENSE "$staged_app/Contents/Resources/LICENSE"
 swiftc -parse-as-library Sources/Kinesis/KinesisMark.swift scripts/export-icon.swift -o .build/tools/export-icon
 .build/tools/export-icon "$stage_dir/Kinesis.iconset"
 iconutil -c icns "$stage_dir/Kinesis.iconset" -o "$staged_app/Contents/Resources/Kinesis.icns"

@@ -21,12 +21,30 @@ public struct BandEvent: Sendable {
     public enum Payload: Sendable {
         case devices([BandDevice])
         case battery(Int)
+        case batteryStatus(BandBatteryStatus?)
         case preparing, connected, disconnected, heartbeat
         case gesture(BandGesture)
         case dialState(Bool)
         case dialTurn(Double)
+        case gyro(timestamp: UInt64, values: SIMD3<Double>)
+        /// The band confirmed (or refused, or never answered) a change of motion streams.
+        case motionStreams(MotionStreams, confirmedAfter: Double, accepted: Bool)
+        /// Unit quaternion in captured wire order: w, x, y, z.
+        case orientation(timestamp: UInt64, values: SIMD4<Double>)
+        /// A decoded sensor data frame arrived (gesture, motion, orientation, or
+        /// raw emg). Tells streaming data apart from ack-only liveness.
+        case dataSeen
         case handedness(BandHand)
         case handednessFailure(String)
+        case ceremonyHTTP(CeremonyHTTPRequest)
+        case ceremonyStage(String)
+        /// One decrypted raw emg sample frame. Sensor data only; no key material rides this path.
+        case rawEMGFrame(Data)
+        case rawEMGConfiguration(EMGConfiguration)
+        case rawEMGState(Bool)
+        case rawEMGFailure(String)
+        /// The input channel read is waiting on a system Bluetooth pairing request.
+        case systemPairingPending
     }
     public let payload: Payload
     public let receivedAt: Double
@@ -97,7 +115,7 @@ public struct GestureRouter: Sendable {
             gesture = .swipe(direction)
             source = derived[message.derivedAction] == nil ? "raw" : "derived"
         } else {
-            let actions = ["singleTap": "tap", "doubleTap": "doubletap"]
+            let actions = ["singleTap": "tap", "doubleTap": "doubletap", "buttonHold": "hold"]
             let action = actions[message.derivedAction] ?? message.action
             guard let tap = TapGesture.allCases.first(where: { $0.finger == message.finger && $0.action == action }) else { return nil }
             gesture = .tap(tap)
@@ -127,11 +145,20 @@ public enum RecognizedGesture: Hashable, Sendable {
 }
 
 public enum TapGesture: String, CaseIterable, Identifiable, Sendable {
-    case indexTap, indexDoubleTap, middleTap, middleDoubleTap
+    // An index hold is the dial, so only the middle finger has a hold of its own.
+    case indexTap, indexDoubleTap, middleTap, middleDoubleTap, middleHold
     public var id: String { rawValue }
     public var finger: String { self == .indexTap || self == .indexDoubleTap ? "index" : "middle" }
-    public var action: String { self == .indexTap || self == .middleTap ? "tap" : "doubletap" }
-    public var label: String { "\(finger.capitalized) \(action == "tap" ? "tap" : "double tap")" }
+    public var action: String {
+        switch self {
+        case .indexTap, .middleTap: "tap"
+        case .indexDoubleTap, .middleDoubleTap: "doubletap"
+        case .middleHold: "hold"
+        }
+    }
+    /// The motion in plain words: tap, double tap, or hold.
+    public var motion: String { action == "doubletap" ? "double tap" : action }
+    public var label: String { "\(finger.capitalized) \(motion)" }
 }
 
 public enum DialTarget: String, CaseIterable, Identifiable, Sendable {
@@ -243,4 +270,16 @@ public struct ActionGate: Sendable {
         lastAction = now
         return true
     }
+}
+
+/// Which motion streams the band sends, besides gestures.
+public struct MotionStreams: Equatable, Sendable {
+    public var gyro: Bool
+    public var orientation: Bool
+    public init(gyro: Bool, orientation: Bool) {
+        self.gyro = gyro
+        self.orientation = orientation
+    }
+    public static let all = MotionStreams(gyro: true, orientation: true)
+    public static let none = MotionStreams(gyro: false, orientation: false)
 }

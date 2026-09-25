@@ -8,14 +8,37 @@ struct KinesisError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-enum BandOperation { case scan, connect(String) }
+enum BandOperation {
+    case scan, connect(String), enroll(String?)
+
+    var isEnrollment: Bool {
+        if case .enroll = self { return true }
+        return false
+    }
+}
 
 @MainActor
-protocol BandConnection {
+protocol BandConnection: AnyObject {
+    func setRawEMGEnabled(_ enabled: Bool) throws
     func start(_ operation: BandOperation, onEvent: @escaping (BandEvent) -> Void,
                onEnd: @escaping (Error?) -> Void) throws
     func stop()
     func setHandedness(_ hand: BandHand) throws
+    func resumeCeremony(_ completion: CeremonyCompletion) throws
+    /// Which motion streams to keep on. Applied now if connected, or at the next subscription.
+    func setMotionStreams(_ streams: MotionStreams)
+    /// Turns the motion streams off and on again, to clear a backed-up stream.
+    func restartMotionStreams()
+}
+
+extension BandConnection {
+    func setMotionStreams(_ streams: MotionStreams) {}
+    func restartMotionStreams() {}
+
+    /// Only the native connection runs an enrollment ceremony.
+    func resumeCeremony(_ completion: CeremonyCompletion) throws {
+        throw KinesisError(message: "This connection can't run an enrollment")
+    }
 }
 
 /// CoreBluetooth and its L2CAP streams share the main run loop in common modes.
@@ -28,6 +51,9 @@ final class NativeBandConnection: NSObject, BandConnection,
     private var channel: CBL2CAPChannel?
     private var batteryCharacteristic: CBCharacteristic?
     private var nextBatteryRead = 0.0
+    private var nextBatteryStatusRead = 0.0
+    private var rawEMGMode = false
+    private var motionMode = MotionStreams.all
     private var session: BandSession?
     private var onEvent: ((BandEvent) -> Void)?
     private var onEnd: ((Error?) -> Void)?
@@ -37,10 +63,22 @@ final class NativeBandConnection: NSObject, BandConnection,
     private var timer: Timer?
     private var deadline = Double.infinity
     private var lastReadAt = 0.0
+    private var lastSensorReadAt = 0.0
     private var lastStatusQuery = 0.0
+    private var trafficMetricsAt = 0.0
+    private var lastTickAt = 0.0
+    private var maxTickGap = 0.0
+    private var maxReadGap = 0.0
+    private var readBytes = 0
+    private var writtenBytes = 0
+    private var previousMotionMessages = 0
     private var stopping = false
     private var disconnecting = false
     private var failure: Error?
+    private var stage = "idle"
+    private var inputReadStartedAt: Double?
+    private var systemPairingNoted = false
+    private var identityRejected: Set<String> = []
     private var lease: Int32 = -1
     private var activity: NSObjectProtocol?
     private let log = Logger(subsystem: "local.callbacked.kinesis", category: "bluetooth")
@@ -56,6 +94,9 @@ final class NativeBandConnection: NSObject, BandConnection,
         if case .connect(let address) = operation, UUID(uuidString: address) == nil {
             throw KinesisError(message: "Choose a band before connecting")
         }
+        if case .enroll(let address) = operation, let address, UUID(uuidString: address) == nil {
+            throw KinesisError(message: "Choose a band before enrolling it")
+        }
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Kinesis", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -70,6 +111,7 @@ final class NativeBandConnection: NSObject, BandConnection,
         stopping = false
         disconnecting = false
         failure = nil
+        stage = "waiting for Bluetooth"
         discovered.removeAll()
         self.onEvent = onEvent
         self.onEnd = onEnd
@@ -77,20 +119,37 @@ final class NativeBandConnection: NSObject, BandConnection,
             activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
                                                              reason: "Receive Neural Band controls")
         }
-        deadline = now + 30
+        // Enrollment walks the full ownership ceremony over HTTP before the
+        // startup flow, so its budget is larger than a plain connection's.
+        deadline = now + (operation.isEnrollment ? 180 : 30)
         lastReadAt = now
+        lastSensorReadAt = now
         lastStatusQuery = now
+        trafficMetricsAt = now
+        lastTickAt = now
+        maxTickGap = 0
+        maxReadGap = 0
+        readBytes = 0
+        writtenBytes = 0
+        previousMotionMessages = 0
         timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
         RunLoop.main.add(timer!, forMode: .common)
         central = CBCentralManager(delegate: self, queue: .main, options: [CBCentralManagerOptionShowPowerAlertKey: false])
-        log.notice("Native band operation started")
+        switch operation {
+        case .scan: log.notice("Native band scan started")
+        case .connect(let address):
+            log.notice("Native band connection started for \(address, privacy: .private(mask: .hash))")
+        case .enroll(let address):
+            log.notice("Native band enrollment started for \(address ?? "the next band in pairing mode", privacy: .public)")
+        }
     }
 
     func stop() {
         guard onEnd != nil, !stopping, !disconnecting else { return }
         stopping = true
+        stage = "stopping streams"
         do {
             let bytes = try session?.stop() ?? Data()
             guard !bytes.isEmpty, channel != nil else { disconnect(); return }
@@ -98,6 +157,34 @@ final class NativeBandConnection: NSObject, BandConnection,
             deadline = now + 3
             try flushOutput()
         } catch { fail(error) }
+    }
+
+    func setMotionStreams(_ streams: MotionStreams) {
+        motionMode = streams
+        guard let session, !stopping, !disconnecting else { return }
+        do {
+            outgoing.append(try session.setMotionStreams(streams, at: now))
+            try flushOutput()
+        } catch { fail(error) }
+    }
+
+    func restartMotionStreams() {
+        guard let session, !stopping, !disconnecting else { return }
+        do {
+            let request = try session.restartMotionStreams(at: now)
+            guard !request.isEmpty else { return }
+            log.notice("Restarting the motion streams to clear a backlog")
+            outgoing.append(request)
+            try flushOutput()
+        } catch { fail(error) }
+    }
+
+    func setRawEMGEnabled(_ enabled: Bool) throws {
+        rawEMGMode = enabled
+        if let session, !stopping, !disconnecting {
+            outgoing.append(try session.setRawEMGEnabled(enabled, at: now))
+            try flushOutput()
+        }
     }
 
     func setHandedness(_ hand: BandHand) throws {
@@ -109,16 +196,50 @@ final class NativeBandConnection: NSObject, BandConnection,
         log.notice("Requested band hand: \(hand.rawValue, privacy: .public)")
     }
 
+    func resumeCeremony(_ completion: CeremonyCompletion) throws {
+        guard let session, channel != nil, !stopping, !disconnecting else {
+            throw KinesisError(message: "The band connection closed during the enrollment")
+        }
+        switch completion {
+        case .pairRequest(let signature, let receipt):
+            outgoing.append(try session.ceremonyPairRequestCompleted(signature: signature, receipt: receipt))
+        case .pair(let signature, let receipt, let devicePublicKey):
+            outgoing.append(try session.ceremonyPairCompleted(signature: signature, receipt: receipt,
+                                                              devicePublicKey: devicePublicKey))
+        }
+        try flushOutput()
+    }
+
     private func emit(_ event: BandEvent) {
         guard !disconnecting, !stopping else { return }
         if case .handedness(let hand) = event.payload {
             log.notice("Band hand confirmed: \(hand.rawValue, privacy: .public)")
+        }
+        switch event.payload {
+        case .batteryStatus(let status):
+            if let status {
+                log.info("Battery status: \(status.level, privacy: .public)%, charging \(String(describing: status.charging), privacy: .public)")
+            } else { log.info("Battery charging status unavailable") }
+        case .rawEMGConfiguration(let config):
+            log.notice("EMG configuration: \(config.channels, privacy: .public) channels at \(config.sampleRate, privacy: .public) Hz, encoding \(config.encoding, privacy: .public)")
+        case .rawEMGState(let enabled):
+            log.notice("EMG subscription confirmed: \(enabled, privacy: .public)")
+        case .rawEMGFailure(let message):
+            log.error("EMG subscription: \(message, privacy: .public)")
+        case .rawEMGFrame:
+            if session?.rawEMGFrames == 1 { log.notice("First EMG sensor payload received") }
+        case .motionStreams(let streams, let after, let accepted):
+            log.notice("Motion streams gyro \(streams.gyro, privacy: .public), orientation \(streams.orientation, privacy: .public); band answered after \(after, privacy: .public)s, as asked: \(accepted, privacy: .public)")
+        default: break
         }
         onEvent?(event)
     }
 
     private func tick() {
         guard onEnd != nil else { return }
+        let time = now
+        maxTickGap = max(maxTickGap, time - lastTickAt)
+        lastTickAt = time
         if now >= deadline {
             if disconnecting { finish(); return }
             if stopping { disconnect(); return }
@@ -126,24 +247,51 @@ final class NativeBandConnection: NSObject, BandConnection,
                 log.notice("Startup timed out: \(session.authenticatedPackets, privacy: .public) verified packets, streams enabled: \(session.streamsEnabled, privacy: .public), motion samples: \(session.motionMessages, privacy: .public)")
             }
             if case .scan = operation {
+                log.notice("Native band scan finished: \(self.discovered.count, privacy: .public) bands found")
                 emit(BandEvent(.devices(discovered.values.sorted { ($0.rssi ?? -127) > ($1.rssi ?? -127) })))
                 disconnect()
             } else { fail(KinesisError(message: "The band took too long to respond. Try reconnecting.")) }
             return
         }
         guard !disconnecting else { return }
+        if !stopping, !systemPairingNoted, let started = inputReadStartedAt, now - started >= 1.5 {
+            // This read answers in milliseconds on a bonded link. A slow one means
+            // macOS is pairing, which waits on a request the user has to accept.
+            systemPairingNoted = true
+            deadline = max(deadline, now + 40)
+            log.notice("Input channel read is waiting; macOS is likely asking to pair")
+            emit(BandEvent(.systemPairingPending))
+        }
         if !stopping, let batteryCharacteristic, now >= nextBatteryRead {
             nextBatteryRead = now + 60
             peripheral?.readValue(for: batteryCharacteristic)
         }
         if !stopping, let session {
             for event in session.tick(at: now) { emit(event) }
-            if session.streamsEnabled, now - lastReadAt >= 2, now - lastStatusQuery >= 2 {
+            do { outgoing.append(try session.flushMotion(at: now)) } catch { fail(error); return }
+            if session.streamsEnabled, now >= nextBatteryStatusRead {
+                nextBatteryStatusRead = now + 5
+                do {
+                    outgoing.append(try session.queryBatteryStatus(at: now))
+                    try flushOutput()
+                } catch { fail(error) }
+            }
+            if session.streamsEnabled, now - lastSensorReadAt >= 2, now - lastStatusQuery >= 2 {
                 do {
                     outgoing.append(try session.queryStreamState())
                     lastStatusQuery = now
                     try flushOutput()
                 } catch { fail(error) }
+            }
+            if session.streamsEnabled, time - trafficMetricsAt >= 10 {
+                let motion = session.motionMessages - previousMotionMessages
+                log.info("Band traffic: \(self.readBytes, privacy: .public) bytes read, \(self.writtenBytes, privacy: .public) written, \(self.outgoing.count, privacy: .public) queued; \(motion, privacy: .public) motion samples; sensor age \(time - self.lastSensorReadAt, privacy: .public)s; read gap max \(self.maxReadGap, privacy: .public)s; timer gap max \(self.maxTickGap, privacy: .public)s")
+                trafficMetricsAt = time
+                previousMotionMessages = session.motionMessages
+                readBytes = 0
+                writtenBytes = 0
+                maxReadGap = 0
+                maxTickGap = 0
             }
         }
     }
@@ -164,8 +312,12 @@ final class NativeBandConnection: NSObject, BandConnection,
         if case .connect(let address) = operation, let identifier = UUID(uuidString: address),
            let known = central.retrievePeripherals(withIdentifiers: [identifier]).first {
             connect(known)
+        } else if case .enroll(let address) = operation, let address, let identifier = UUID(uuidString: address),
+                  let known = central.retrievePeripherals(withIdentifiers: [identifier]).first {
+            connect(known)
         } else {
             if case .scan = operation { deadline = now + 10 }
+            stage = "scanning"
             central.scanForPeripherals(withServices: nil)
         }
     }
@@ -181,12 +333,20 @@ final class NativeBandConnection: NSObject, BandConnection,
             }
         case .connect(let address):
             if peripheral.identifier == UUID(uuidString: address), self.peripheral == nil { connect(peripheral) }
+        case .enroll(let address):
+            guard self.peripheral == nil else { return }
+            if let address {
+                if peripheral.identifier == UUID(uuidString: address) { connect(peripheral) }
+            } else if name.lowercased().hasPrefix("meta band") {
+                connect(peripheral)
+            }
         case nil: break
         }
     }
 
     private func connect(_ peripheral: CBPeripheral) {
         self.peripheral = peripheral
+        stage = "connecting"
         central?.stopScan()
         central?.connect(peripheral)
     }
@@ -194,6 +354,7 @@ final class NativeBandConnection: NSObject, BandConnection,
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard central === self.central, peripheral === self.peripheral, !stopping, !disconnecting else { return }
         log.notice("Native Bluetooth connected")
+        stage = "discovering services"
         emit(BandEvent(.preparing))
         peripheral.delegate = self
         peripheral.discoverServices([serviceID, batteryServiceID])
@@ -206,7 +367,7 @@ final class NativeBandConnection: NSObject, BandConnection,
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         guard central === self.central, peripheral === self.peripheral else { return }
-        if !stopping && !disconnecting { failure = error ?? KinesisError(message: "The band disconnected") }
+        if !stopping && !disconnecting { recordFailure(error ?? KinesisError(message: "The band disconnected")) }
         finish()
     }
 
@@ -217,6 +378,7 @@ final class NativeBandConnection: NSObject, BandConnection,
             fail(KinesisError(message: "This device doesn't expose the band input service")); return
         }
         log.info("Band services discovered")
+        stage = "discovering characteristics"
         for service in services {
             peripheral.discoverCharacteristics(service.uuid == serviceID ? [psmID] : [batteryID], for: service)
         }
@@ -231,10 +393,15 @@ final class NativeBandConnection: NSObject, BandConnection,
         if service.uuid == serviceID, service.characteristics?.contains(where: { $0.uuid == psmID }) != true {
             fail(KinesisError(message: "Band input channel is unavailable")); return
         }
+        if service.uuid == serviceID {
+            stage = "reading input channel"
+            inputReadStartedAt = now
+        }
         for characteristic in service.characteristics ?? [] {
             if characteristic.uuid == batteryID {
                 batteryCharacteristic = characteristic
                 nextBatteryRead = now + 60
+                if characteristic.properties.contains(.notify) { peripheral.setNotifyValue(true, for: characteristic) }
             }
             peripheral.readValue(for: characteristic)
         }
@@ -248,11 +415,17 @@ final class NativeBandConnection: NSObject, BandConnection,
             }
             return
         }
-        if let error { fail(error); return }
+        inputReadStartedAt = nil
+        if let error {
+            let native = error as NSError
+            log.error("Input channel read failed: \(native.domain, privacy: .public) \(native.code, privacy: .public)")
+            fail(Self.explainingPairing(error)); return
+        }
         guard characteristic.uuid == psmID, let bytes = characteristic.value, bytes == Data([255, 0]) else {
             fail(KinesisError(message: "Unsupported band input channel")); return
         }
         log.info("Opening native L2CAP channel")
+        stage = "opening input channel"
         peripheral.openL2CAPChannel(255)
     }
 
@@ -262,7 +435,24 @@ final class NativeBandConnection: NSObject, BandConnection,
         guard let channel else { fail(KinesisError(message: "Could not open the band input stream")); return }
         do {
             log.info("Native L2CAP channel opened")
-            let session = try BandSession()
+            stage = "handshaking"
+            let identifier = peripheral.identifier.uuidString
+            let session: BandSession
+            if case .enroll = operation {
+                // A fresh ceremony replaces the ownership record, so past
+                // identity rejections no longer apply to the adopted key.
+                identityRejected.remove(identifier)
+                // A pairing-mode band runs the ownership ceremony with a fresh
+                // app identity; the enrolled startup takes over after it.
+                log.notice("Starting band ownership ceremony")
+                session = try BandSession(ceremony: OwnershipCeremony(bandID: identifier), rawEMG: rawEMGMode, motion: motionMode)
+            } else {
+                // A stored identity authenticates enrolled bands; a band that
+                // rejected the identity falls back to the legacy startup.
+                let enrollment = identityRejected.contains(identifier) ? nil : BandIdentity.enrollment(for: identifier)
+                if enrollment != nil { log.notice("Authenticating with the stored band identity") }
+                session = try BandSession(enrollment: enrollment, rawEMG: rawEMGMode, motion: motionMode)
+            }
             self.session = session
             self.channel = channel
             outgoing = try session.request()
@@ -301,16 +491,24 @@ final class NativeBandConnection: NSObject, BandConnection,
         let count = input.read(&buffer, maxLength: buffer.count)
         guard count >= 0 else { throw input.streamError ?? KinesisError(message: "Could not read band input") }
         guard count > 0 else { return }
-        lastReadAt = now
+        let time = now
+        maxReadGap = max(maxReadGap, time - lastReadAt)
+        lastReadAt = time
+        readBytes += count
         let wasEnabled = session.streamsEnabled
         let wasAuthenticated = session.authenticatedPackets > 0
-        let result = try session.feed(Data(buffer.prefix(count)), at: now)
+        let result = try session.feed(Data(buffer.prefix(count)), at: time)
         if !wasAuthenticated, session.authenticatedPackets > 0 { log.info("Native encrypted packet verified") }
         if !wasEnabled, session.streamsEnabled { log.notice("Band acknowledged gesture and motion subscription") }
         outgoing.append(result.outgoing)
+        if !wasEnabled {
+            log.info("Native startup read: \(count, privacy: .public) bytes, \(session.authenticatedPackets, privacy: .public) verified packets, \(result.outgoing.count, privacy: .public) reply bytes, \(self.outgoing.count, privacy: .public) queued bytes")
+        }
         for event in result.events {
+            if case .dataSeen = event.payload { lastSensorReadAt = time }
             if case .connected = event.payload {
                 deadline = .infinity
+                stage = "receiving input"
                 log.notice("Native band input subscription ready")
             }
             emit(event)
@@ -321,21 +519,59 @@ final class NativeBandConnection: NSObject, BandConnection,
 
     private func flushOutput() throws {
         guard let output = channel?.outputStream else { return }
+        let queued = outgoing.count
         while !outgoing.isEmpty, output.hasSpaceAvailable {
             let count = outgoing.withUnsafeBytes { output.write($0.bindMemory(to: UInt8.self).baseAddress!, maxLength: outgoing.count) }
             guard count >= 0, count <= outgoing.count else {
                 throw output.streamError ?? KinesisError(message: "Could not write to the band")
             }
             guard count > 0 else { return }
+            writtenBytes += count
             outgoing = Data(outgoing.dropFirst(count))
+        }
+        if queued > 0, session?.streamsEnabled != true {
+            log.info("Native startup write: \(queued - self.outgoing.count, privacy: .public) bytes written, \(self.outgoing.count, privacy: .public) queued bytes")
         }
     }
 
     private func fail(_ error: Error) {
         guard onEnd != nil, !disconnecting else { return }
-        failure = error
-        log.error("Native connection error: \(error.localizedDescription, privacy: .public)")
+        if error is BandIdentityMismatchError, let peripheral {
+            identityRejected.insert(peripheral.identifier.uuidString)
+            log.notice("Stored band identity rejected; reconnecting without it")
+        }
+        recordFailure(error)
         disconnect()
+    }
+
+    /// Seen once, after a factory reset: the band had a new identity key, macOS accepted the
+    /// pairing request, and then dropped the pairing because the band's old entry was still in
+    /// its list ("already paired, with a different irk. Unpair first"). No app can remove that
+    /// entry. The advice stays a suggestion, because one sighting is not a rule.
+    static let stalePairingAdvice = "macOS couldn't finish pairing with your band. If the band has an old entry under System Settings › Bluetooth, forget it there and pair again."
+    static let bluetoothSettings = URL(string: "x-apple.systempreferences:com.apple.BluetoothSettings")!
+
+    /// CoreBluetooth reports a system pairing that went wrong as an ATT security error. The
+    /// raw text tells the user nothing they can act on, and the two causes need different advice.
+    static func explainingPairing(_ error: Error) -> Error {
+        let native = error as NSError
+        guard native.domain == CBATTErrorDomain else { return error }
+        switch native.code {
+        case CBATTError.insufficientEncryption.rawValue:
+            // The request was accepted, and the link still is not trusted: the stale entry.
+            return KinesisError(message: stalePairingAdvice)
+        case CBATTError.insufficientAuthentication.rawValue, CBATTError.insufficientAuthorization.rawValue:
+            // The request was missed, declined, or timed out.
+            return KinesisError(message: "macOS didn't finish pairing with your band. Pair again and accept the Bluetooth request when it appears. If none appears, restart your Mac.")
+        default:
+            return error
+        }
+    }
+
+    private func recordFailure(_ error: Error) {
+        failure = error
+        let nativeError = error as NSError
+        log.error("Native connection error during \(self.stage, privacy: .public): \(nativeError.domain, privacy: .public) \(nativeError.code, privacy: .public): \(error.localizedDescription, privacy: .public)")
     }
 
     private func disconnect() {
@@ -344,6 +580,7 @@ final class NativeBandConnection: NSObject, BandConnection,
         if stopping, let session {
             log.notice("Band streams stopped; acknowledged: \(session.stopAcknowledged, privacy: .public)")
         }
+        stage = "disconnecting"
         onEvent?(BandEvent(.disconnected))
         closeStreams()
         central?.stopScan()
@@ -380,10 +617,13 @@ final class NativeBandConnection: NSObject, BandConnection,
         session = nil
         outgoing.removeAll()
         operation = nil
+        stage = "idle"
+        inputReadStartedAt = nil
+        systemPairingNoted = false
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
         activity = nil
         if lease >= 0 { flock(lease, LOCK_UN); close(lease); lease = -1 }
+        log.notice("Native band operation closed")
         onEnd(failure)
-        log.notice("Native band connection closed")
     }
 }

@@ -1,7 +1,5 @@
-# kinesis 0.1.1
+# kinesis 0.4.0
 
-fixes the left hand setting and pinch + turn direction. kinesis now sets the hand on the band and reads it back to check it stuck. swipe directions stay as the band reports them.
+adds an experimental air cursor. move your arm to move the mouse. pinch your index to left click, hold the pinch to drag, and pinch your middle finger to right click. you can find it in developer mode.
 
-tested on both wrists and after reconnecting. 44 swift tests pass.
-
-download the dmg and drag kinesis into applications. signed and notarized, for macos 14+ on apple silicon and intel.
+the readings screen now shows gyro readings along with the semg outputs.
