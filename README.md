@@ -1,5 +1,8 @@
 # kinesis for linux
 
+<img width="1006" height="749" alt="Screenshot_20260925_184016" src="https://github.com/user-attachments/assets/6a8c081d-a97d-4316-8227-6ef0132d525e" />
+
+
 use your meta neural band to control a linux desktop: swipe between desktops, open the overview,
 control your music, pinch + turn for volume or brightness, and (experimentally) move the pointer
 with your forearm. a tray icon and a kirigami window for kde plasma, with the band in a background
