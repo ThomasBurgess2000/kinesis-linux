@@ -54,12 +54,12 @@ QQC2.ScrollView {
         }
 
         FormCard.FormCard {
-            FormCard.FormSwitchDelegate {
+            DaemonSwitch {
                 text: "Live EMG"
                 description: readingsPage.status
-                checked: readingsPage.readings.wanted === true
+                value: readingsPage.readings.wanted === true
                 enabled: readingsPage.live && !readingsPage.readings.pending
-                onToggled: daemon.setConfig({ rawEMG: checked })
+                onRequested: (on) => daemon.setConfig({ rawEMG: on })
             }
         }
 

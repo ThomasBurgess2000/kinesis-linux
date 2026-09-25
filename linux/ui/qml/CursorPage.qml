@@ -71,15 +71,12 @@ QQC2.ScrollView {
         }
 
         FormCard.FormCard {
-            FormCard.FormSwitchDelegate {
+            DaemonSwitch {
                 text: "Air cursor"
                 description: "Experimental. " + cursorPage.status
-                checked: cursorPage.cursor.enabled === true
+                value: cursorPage.cursor.enabled === true
                 enabled: cursorPage.cursor.enabled === true || cursorPage.cursor.available === true
-                onToggled: {
-                    daemon.setAirCursor(checked);
-                    checked = Qt.binding(() => cursorPage.cursor.enabled === true);
-                }
+                onRequested: (on) => daemon.setAirCursor(on)
             }
         }
 

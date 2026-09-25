@@ -65,28 +65,28 @@ QQC2.ScrollView {
 
         FormCard.FormHeader { title: "This computer" }
         FormCard.FormCard {
-            FormCard.FormSwitchDelegate {
+            DaemonSwitch {
                 text: "Start automatically"
                 description: "Connect your band and enable controls when Kinesis starts."
-                checked: daemon.config.startAutomatically !== false
-                onToggled: daemon.setConfig({ startAutomatically: checked })
+                value: daemon.config.startAutomatically !== false
+                onRequested: (on) => daemon.setConfig({ startAutomatically: on })
             }
             FormCard.FormDelegateSeparator {}
-            FormCard.FormSwitchDelegate {
+            DaemonSwitch {
                 text: "Start at login"
                 description: "Run Kinesis in the background and show it in the system tray when you log in."
-                checked: daemon.startAtLogin
-                onToggled: daemon.setStartAtLogin(checked)
+                value: daemon.startAtLogin
+                onRequested: (on) => daemon.setStartAtLogin(on)
             }
         }
 
         FormCard.FormHeader { title: "Developer" }
         FormCard.FormCard {
-            FormCard.FormSwitchDelegate {
+            DaemonSwitch {
                 text: "Developer mode"
                 description: "Unlocks readings (live muscle signals and motion, raw recording) and the experimental air cursor."
-                checked: daemon.config.developerMode === true
-                onToggled: daemon.setConfig({ developerMode: checked })
+                value: daemon.config.developerMode === true
+                onRequested: (on) => daemon.setConfig({ developerMode: on })
             }
         }
 
