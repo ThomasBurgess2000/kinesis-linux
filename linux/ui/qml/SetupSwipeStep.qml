@@ -1,4 +1,5 @@
-// Setup step 2: try each swipe; each direction ticks off as the band reports it.
+// Setup step 2: try each swipe; each direction ticks off as the band reports it. Until the band
+// sends something, the hand acts out the swipe you pick; after that it mirrors the band.
 
 import QtQuick
 import QtQuick.Controls as QQC2
@@ -12,10 +13,25 @@ ColumnLayout {
     property var seen: ({})
     readonly property int count: Object.keys(seen).length
     readonly property var icons: ({ left: "go-previous", right: "go-next", up: "go-up", down: "go-down" })
+    property string preview: "left"
+    property bool received: false
+    property string handHighlight: "index"
+
+    function demonstrate(direction) {
+        preview = direction;
+        handHighlight = "index";
+        hand.play({ kind: "swipe", key: "swipe:" + direction });
+    }
+
+    // The hand acts out its swipe the moment the step appears.
+    StackLayout.onIsCurrentItemChanged: if (StackLayout.isCurrentItem && !received) demonstrate(preview)
 
     Connections {
         target: daemon
         function onGesture(gesture) {
+            step.received = true;
+            step.handHighlight = gesture.key.startsWith("tap:middle") ? "middle" : "index";
+            hand.play(gesture);
             if (gesture.kind !== "swipe") return;
             const next = Object.assign({}, step.seen);
             next[gesture.key] = true;
@@ -42,6 +58,22 @@ ColumnLayout {
             : "Pair your band to try swiping."
     }
 
+    Item {
+        Layout.alignment: Qt.AlignHCenter
+        implicitWidth: Kirigami.Units.gridUnit * 15
+        implicitHeight: implicitWidth
+
+        HandView {
+            id: hand
+            anchors.fill: parent
+            margin: 0.7
+            hand: step.ctl.bandHand === "left" ? "left" : "right"
+            highlight: step.ctl.pinchedFinger ? (step.ctl.pinchedFinger === "middle" ? "middle" : "index") : step.handHighlight
+            sustained: !!step.ctl.pinchedFinger
+        }
+        ElectrodeRing { anchors.fill: parent }
+    }
+
     RowLayout {
         Layout.alignment: Qt.AlignHCenter
         spacing: Kirigami.Units.largeSpacing
@@ -51,6 +83,9 @@ ColumnLayout {
                 required property var modelData
                 readonly property bool done: !!step.seen["swipe:" + modelData.id]
                 implicitWidth: Kirigami.Units.gridUnit * 8
+                showClickFeedback: true
+                highlighted: !step.received && step.preview === modelData.id
+                onClicked: step.demonstrate(modelData.id)
                 contentItem: ColumnLayout {
                     Kirigami.Icon {
                         Layout.alignment: Qt.AlignHCenter

@@ -13,7 +13,7 @@ use your meta neural band to control a linux desktop. same protocol and gesture 
 - for the built-in kde backend: plasma 6 with `qdbus6` (package `qt6-tools` or `qdbus-qt6`); optionally `ydotool` with `ydotoold` running for the escape and tab actions
 - for other desktops: `xdotool`, `ydotool`, `wtype`, or any command you want to map
 - for the app (tray icon + window): pyside6 with its qml modules, and kirigami + kirigami addons (installed with plasma):
-  `sudo apt install python3-pyside6.qtqml python3-pyside6.qtquick python3-pyside6.qtnetwork`
+  `sudo apt install python3-pyside6.qtqml python3-pyside6.qtquick python3-pyside6.qtnetwork qml6-module-qtquick3d`
 
 ## the app
 
@@ -33,7 +33,7 @@ wrist, try a swipe, try pinch + turn on a practice dial, then a summary with a t
 that the window has:
 
 - **band column**: status, battery, gesture count, and the one next step (pair, connect, enable or pause controls)
-- **overview**: the last gesture and what it did, live, and your assignments
+- **overview**: a 3d hand that mirrors the band (it lights the fingertips of each gesture, acts it out, holds a pinch as long as you do, and turns with your wrist on the dial, inside the band's ring of electrodes), what the gesture did, and your assignments
 - **gestures**: an action for each swipe and tap, and the pinch dial's target and sensitivity. changes apply immediately
 - **band**: wrist, start automatically, start at login, meta account, diagnostics with a test action, and forget this band
 

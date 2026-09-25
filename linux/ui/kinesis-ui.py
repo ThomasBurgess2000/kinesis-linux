@@ -11,10 +11,11 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Property, QObject, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QIcon, QSurfaceFormat
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickWindow  # noqa: F401 (so the root object comes back as a QQuickWindow)
@@ -447,10 +448,15 @@ def run_check(engine: QQmlApplicationEngine, app: QApplication, daemon: Daemon, 
     app.processEvents()
     daemon._take_catalog(catalog)
 
-    def settle_and_shoot(name: str) -> None:
+    def settle_and_shoot(name: str, seconds: float = 0) -> None:
         for _ in range(20):
             app.processEvents()
-        if shots:
+        # Let animations (the hand's springs and glow) run on for a while.
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            app.processEvents()
+            time.sleep(0.005)
+        if shots and name:
             Path(shots).mkdir(parents=True, exist_ok=True)
             window.grabWindow().save(str(Path(shots) / f"{name}.png"))
 
@@ -463,6 +469,18 @@ def run_check(engine: QQmlApplicationEngine, app: QApplication, daemon: Daemon, 
     for page, name in enumerate(["overview", "gestures", "band", "readings"]):
         window.setProperty("currentPage", page)
         settle_and_shoot(f"page-{page}-{name}")
+    # The overview's hand: a double tap caught mid-motion, then a held pinch turning the dial.
+    window.setProperty("currentPage", 0)
+    daemon.gesture.emit({"kind": "tap", "key": "tap:indexDoubleTap", "label": "Index double tap",
+                         "action": "playPause", "actionTitle": "Play / pause"})
+    settle_and_shoot("overview-tap", 0.1)
+    controller = daemon.state["controller"]
+    daemon._take_state({**daemon.state, "controller": {**controller, "dialEngaged": True, "pinchedFinger": "index"}})
+    settle_and_shoot("", 0.05)
+    for _ in range(5):
+        daemon.dial.emit(6.0)
+    settle_and_shoot("overview-dial", 0.6)
+    daemon._take_state({**daemon.state, "controller": controller})
     window.setProperty("showingSetup", True)
     for step, name in enumerate(["pair", "swipe", "dial", "summary"]):
         window.setProperty("setupStep", step)
@@ -486,6 +504,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.check:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        # The offscreen platform defaults to the software renderer, which can't draw the 3D hand.
+        os.environ.setdefault("QT_QUICK_BACKEND", "rhi")
+    # The overview hand is Qt Quick 3D, which wants OpenGL 3.3 core rather than whatever the
+    # platform offers first (the offscreen platform's is 2.0).
+    surface = QSurfaceFormat()
+    surface.setVersion(3, 3)
+    surface.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+    surface.setDepthBufferSize(24)
+    surface.setStencilBufferSize(8)
+    QSurfaceFormat.setDefaultFormat(surface)
     # Plasma's platform theme picks these anyway; being explicit keeps the window native elsewhere
     # (and makes --check render what you'd actually see).
     os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop")
