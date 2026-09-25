@@ -34,7 +34,7 @@ export const DEFAULT_CONFIG: Config = {
   security: "low",
   linkSetup: "pipelined",
   configChannel: 0x8006,
-  bond: false,
+  bond: true, // the band drops unbonded links ~30 s in
   directL2cap: true,
   psm: 255,
 };

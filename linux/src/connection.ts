@@ -185,6 +185,18 @@ export class BandConnection {
     if (this.disconnecting) return;
     this.log.info("Band services discovered");
     this.deadline = now() + 30;
+    // The band ends an unbonded link ~30 s in (macOS always bonds it), so pair once; the bond
+    // then persists across connections. The first pairing may wait on the desktop's prompt.
+    if (options.bond) {
+      const state = await bluez.deviceState(device).catch(() => undefined);
+      if (!state?.paired) {
+        this.log.notice("Bonding with the band through BlueZ; accept the pairing prompt if one appears");
+        this.deadline = now() + 95;
+        await bluez.pair(device);
+        if (this.disconnecting) return;
+        this.deadline = now() + 30;
+      }
+    }
     if (!(await bluez.hasService(device, bluez.BAND_SERVICE))) {
       throw new KinesisError("This device doesn't expose the band input service");
     }
@@ -248,7 +260,7 @@ export class BandConnection {
       const wasEnabled = session.streamsEnabled;
       const wasAuthenticated = session.authenticatedPackets > 0;
       const result = session.feed(bytes, time);
-      if (!wasAuthenticated && session.authenticatedPackets > 0) this.log.info(`Encrypted packet verified (band params offered ${session.offeredParams}, negotiated ${session.negotiatedParams})`);
+      if (!wasAuthenticated && session.authenticatedPackets > 0) this.log.info(`Encrypted packet verified (band params offered ${session.offeredParams}, band sends ${session.negotiatedParams}, we send ${session.declaredParams})`);
       if (!wasEnabled && session.streamsEnabled) this.log.notice("Band acknowledged gesture and motion subscription");
       // One AirShield record per SDU: the band's framing does not reassemble across writes.
       for (const packet of result.packets) this.channel?.write(packet);
@@ -266,7 +278,7 @@ export class BandConnection {
       }
       if (this.stopping && session.stopAcknowledged) this.disconnect();
     } catch (error) {
-      if (session.negotiatedParams) this.log.notice(`Band params offered ${session.offeredParams}, negotiated ${session.negotiatedParams}`);
+      if (session.negotiatedParams) this.log.notice(`Band params offered ${session.offeredParams}, band sends ${session.negotiatedParams}, we send ${session.declaredParams}`);
       this.fail(error);
     }
   }

@@ -29,6 +29,13 @@ export interface SessionOptions {
   ceremony?: OwnershipCeremony;
 }
 
+/// Whether two DataX channels are the same channel. Newer firmware tags its channels with
+/// per-connection high bits (0x9801 answering our 0x8001, 0x9802 for its proof), so compare the
+/// channel number in the low byte rather than the whole value.
+function sameChannel(a: number, b: number): boolean {
+  return (a & 0xff) === (b & 0xff);
+}
+
 const FINGERS = ["unknown", "thumb", "index", "middle", "notApplicable"];
 const ACTIONS = ["unknown", "press", "release", "tap", "doubletap", "click", "up", "down", "left", "right", "wake",
   "swipeIn", "swipeOut", "ia", "partialPress", "partialRelease", "partialClick", "partialUp", "partialDown",
@@ -68,6 +75,9 @@ export class BandSession {
   streamsEnabled = false;
   offeredParams = 0n;
   negotiatedParams = 0n;
+  /// The parameters we declare in our EnableEncryption (field 5). Each side sends with the set it
+  /// declared, so this keys our TX while the band's declared set (negotiatedParams) keys RX.
+  declaredParams = 3n;
   private readonly streamFields = [3, 6, 8];
   private readonly streamChannel = 0x8005;
   private readonly configurationChannel: number;
@@ -127,11 +137,12 @@ export class BandSession {
             throw new BandProtocolError(`Unsupported band encryption curve (${fields.integer(3)})`);
           }
           this.offeredParams = fields.integer(4);
+          this.declaredParams = BandSession.declareParams(this.offeredParams);
           this.peerKey = point;
           this.peerChallenge = fields.bytes(2, 16);
           outgoing.push(BandWire.frame(1, [0x02000002], concat(
             BandWire.field(1, this.publicKey), BandWire.field(2, this.seed), BandWire.field(3, this.iv),
-            BandWire.field(4, this.base), BandWire.field(5, 3))));
+            BandWire.field(4, this.base), BandWire.field(5, this.declaredParams))));
           break;
         }
         case 0x02000002: {
@@ -148,13 +159,15 @@ export class BandSession {
           const peerIV = fields.bytes(3, 16);
           const peerBase = fields.integer(4);
           if (peerBase < 0n || peerBase > 0xffffffffn) throw new BandProtocolError("Invalid band packet counter");
-          // The negotiated parameters select the key derivation and MAC format (param 3 vs the
-          // extended 26/31 style). TX uses the peer challenge + our seed; RX uses ours + the peer's.
-          const params = airShieldParams(this.negotiatedParams);
-          const macPrefix = macPrefixFor(this.negotiatedParams);
-          this.transmitter = new AirShieldCipher(AirShieldKeys.derive(secret, peerChallenge, this.seed, params), this.iv, this.base, macPrefix);
+          // Each direction is keyed by the parameters its sender declared (param 3 vs the extended
+          // 26/31 style): TX by ours, RX by the band's. TX uses the peer challenge + our seed; RX
+          // uses ours + the peer's.
+          this.transmitter = new AirShieldCipher(
+            AirShieldKeys.derive(secret, peerChallenge, this.seed, airShieldParams(this.declaredParams)),
+            this.iv, this.base, macPrefixFor(this.declaredParams));
           this.receiver = new AirShieldReceiver(new AirShieldCipher(
-            AirShieldKeys.derive(secret, this.challenge, peerSeed, params), peerIV, Number(peerBase), macPrefix));
+            AirShieldKeys.derive(secret, this.challenge, peerSeed, airShieldParams(this.negotiatedParams)),
+            peerIV, Number(peerBase), macPrefixFor(this.negotiatedParams)));
           if (this.ceremony) {
             // Enrollment startup runs the ownership ceremony instead of the identity queries.
             this.setupStage = "ceremony";
@@ -288,6 +301,15 @@ export class BandSession {
     return this.transmitter.encrypt(data);
   }
 
+  /// Pick the parameter set we declare (and send with) from the band's offer. Bands offering the
+  /// extended bits refuse a param-3 sender, so declare the extended set we implement (26: bits 1,3,4,
+  /// no separate MAC key) whenever the offer contains it; otherwise keep the verified param 3.
+  static declareParams(offered: bigint): bigint {
+    if ((offered & 26n) === 26n) return 26n;
+    if ((offered & 3n) === 3n) return 3n;
+    throw new BandProtocolError(`Unsupported band encryption parameters (${offered})`);
+  }
+
   /// The confirmed transcript preimage; SHA-256 of it is the signed digest.
   private static trustPreimage(challenge: Uint8Array, receiver: Uint8Array, seed: Uint8Array, sender: Uint8Array): Uint8Array {
     return concat(sha256(concat(challenge, receiver)), sha256(concat(seed, sender)));
@@ -302,10 +324,9 @@ export class BandSession {
       concat(BandWire.field(1, sha256(identity.privateKey.publicPoint)), BandWire.field(2, signature)));
   }
 
-  private receiveCeremony(frame: DataXFrame, time: number, outgoing: Uint8Array[]): BandEvent[] {
+  private receiveCeremony(frame: DataXFrame, kind: number, time: number, outgoing: Uint8Array[]): BandEvent[] {
     const ceremony = this.ceremony;
-    const kind = frame.words[frame.words.length - 1];
-    if (!ceremony || kind === undefined) return [];
+    if (!ceremony) return [];
     if ((kind & 0xff000000) === 0x03000000) {
       throw new BandProtocolError(ceremonyFailureMessage(kind & 0xffffff));
     }
@@ -343,9 +364,7 @@ export class BandSession {
     return event({ type: "ceremonyStage", message: "establishing trust" }, time);
   }
 
-  private receiveIdentity(frame: DataXFrame, outgoing: Uint8Array[]): BandEvent[] {
-    const kind = frame.words[frame.words.length - 1];
-    if (kind === undefined) return [];
+  private receiveIdentity(frame: DataXFrame, kind: number, outgoing: Uint8Array[]): BandEvent[] {
     if ((kind & 0xff000000) === 0x03000000 && frame.channel === 2) {
       if (kind !== 0x03001000) {
         if (kind === 0x03001043) {
@@ -368,7 +387,7 @@ export class BandSession {
       }
       this.bandTrusted = true;
       outgoing.push(this.encrypt(BandWire.frame(frame.channel & 0x7fff, [0x03001000])));
-    } else if (kind === 0x02001000 && frame.channel === 0x8001 && this.endLinkSent) {
+    } else if (kind === 0x02001000 && sameChannel(frame.channel, 0x8001) && this.endLinkSent) {
       const fields = new ProtoFields(frame.payload);
       if (fields.requiredInteger(1) !== 1n || fields.bytes(2).length !== 16) {
         throw new BandProtocolError("Unexpected band link setup response");
@@ -415,13 +434,14 @@ export class BandSession {
     const kind = this.channelTypes.get(frame.channel);
     if (kind === undefined) return [];
 
+    // Frames after the first on a channel omit their type words; `kind` is the channel's type.
     if (this.ceremony && this.setupStage === "ceremony" && !this.stopping) {
-      return this.receiveCeremony(frame, time, outgoing);
+      return this.receiveCeremony(frame, kind, time, outgoing);
     }
     if (this.enrollment && this.setupStage === "identity" && !this.stopping) {
-      return this.receiveIdentity(frame, outgoing);
+      return this.receiveIdentity(frame, kind, outgoing);
     }
-    if (kind === 0x02001000 && frame.channel === 0x8001 && this.setupStage === "link" && !this.stopping) {
+    if (kind === 0x02001000 && sameChannel(frame.channel, 0x8001) && this.setupStage === "link" && !this.stopping) {
       const fields = new ProtoFields(frame.payload);
       if (fields.requiredInteger(1) !== 1n) {
         throw new BandProtocolError("The band couldn't finish setting up the connection. Try reconnecting.");
@@ -432,13 +452,13 @@ export class BandSession {
       return [];
     }
     if (kind === 0x0300c001 && !this.stopping) {
-      if (frame.channel === 3 && this.setupStage === "deviceInfo") {
+      if (sameChannel(frame.channel, 3) && this.setupStage === "deviceInfo") {
         throw new BandProtocolError("The band rejected gesture setup. Try reconnecting.");
       }
-      if (frame.channel === 5 && this.setupStage === "input") {
+      if (sameChannel(frame.channel, 5) && this.setupStage === "input") {
         throw new BandProtocolError("The band rejected the input subscription. Try reconnecting.");
       }
-      if (frame.channel === 6 && this.handRequest) {
+      if (sameChannel(frame.channel, 6) && this.handRequest) {
         this.handRequest = undefined;
         this.hand = undefined;
         return [event({ type: "handednessFailure", message: "The band couldn't report its hand setting. Reconnect and try again." }, time)];
@@ -446,7 +466,7 @@ export class BandSession {
       return [];
     }
     if (![0x02000315, 0x0200020d, 0x0200020f, 0x02000212].includes(kind)) return [];
-    if (kind === 0x02000315 && frame.channel === 3 && this.setupStage === "deviceInfo" && !this.stopping) {
+    if (kind === 0x02000315 && sameChannel(frame.channel, 3) && this.setupStage === "deviceInfo" && !this.stopping) {
       const fields = new ProtoFields(frame.payload);
       if (fields.requiredInteger(1) !== 1n) return [];
       if (fields.requiredInteger(2) !== 1n) throw new BandProtocolError("The band rejected gesture setup. Try reconnecting.");
@@ -457,11 +477,11 @@ export class BandSession {
       return [];
     }
     if (this.setupStage !== "input") return [];
-    if (kind === 0x02000315 && (frame.channel & 0x7fff) === (this.configurationChannel & 0x7fff)) {
+    if (kind === 0x02000315 && sameChannel(frame.channel, this.configurationChannel)) {
       if (this.stopping) return [];
       return this.receiveHand(new ProtoFields(frame.payload), time, outgoing);
     }
-    if (kind === 0x02000315 && frame.channel !== (this.streamChannel & 0x7fff)) return [];
+    if (kind === 0x02000315 && !sameChannel(frame.channel, this.streamChannel)) return [];
     const fields = new ProtoFields(frame.payload);
     if (kind === 0x02000315) {
       const request = fields.integer(1);

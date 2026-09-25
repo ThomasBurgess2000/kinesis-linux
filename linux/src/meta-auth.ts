@@ -47,9 +47,14 @@ export function authEntryURL(tokens: SSOTokens): string {
 const makeLSD = (): string => "S0." + Array.from({ length: 6 }, () => Math.floor(Math.random() * 10)).join("");
 const jazoest = (lsd: string): string => "2" + String([...lsd].reduce((sum, c) => sum + c.charCodeAt(0), 0));
 
-const FORM_SAFE = /[^A-Za-z0-9\-._~]/g;
+const FORM_SAFE = /[^A-Za-z0-9\-._~]/;
 export function formEscape(value: string): string {
-  return value.replace(FORM_SAFE, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0"));
+  // Percent-encode the UTF-8 bytes of everything outside the unreserved set, like
+  // addingPercentEncoding(withAllowedCharacters:) does.
+  return Array.from(new TextEncoder().encode(value), (byte) => {
+    const c = String.fromCharCode(byte);
+    return byte < 0x80 && !FORM_SAFE.test(c) ? c : "%" + byte.toString(16).toUpperCase().padStart(2, "0");
+  }).join("");
 }
 export function urlForm(fields: [string, string][]): string {
   return fields.map(([k, v]) => `${k}=${formEscape(v)}`).join("&");

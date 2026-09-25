@@ -59,6 +59,11 @@ test("response parsing pulls receipts and device key, and flags session failures
   expect(final.receipt).toBe("F");
   expect(final.devicePublicKey && final.devicePublicKey.length).toBe(64);
 
+  // The live server nests the key inside the receipt, whose additional_data is a JSON string.
+  const receipt = JSON.stringify({ serial: "S", additional_data: JSON.stringify({ device_ec_public_key: Buffer.from(point).toString("base64") }) });
+  const live = MetaPair.parseFinal({ final_ownership_receipt: receipt, receipt_signature: Buffer.from([9]).toString("base64") });
+  expect(live.devicePublicKey && Buffer.from(live.devicePublicKey).equals(Buffer.from(point))).toBe(true);
+
   expect(MetaPair.isSessionFailure(401, undefined)).toBe(true);
   expect(MetaPair.isSessionFailure(200, { code: 190 })).toBe(true);
   expect(MetaPair.isSessionFailure(200, { code: 1 })).toBe(false);

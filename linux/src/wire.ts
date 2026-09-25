@@ -153,8 +153,11 @@ export class DataXReceiver {
     }
     let bytes = plaintext;
     const padding = bytes[bytes.length - 1]! - 0xc0;
-    // Only the repeated suffix observed on the tested firmware is stripped.
-    if (padding >= 1 && padding <= 15 && bytes.subarray(bytes.length - padding).every((b) => b === 0xc0 + padding)) {
+    // Records end in `n` bytes of 0xc0+n. A record whose data is already block-aligned carries a
+    // whole padding block (n = 16, 0xd0), which firmware emits when it splits a large frame (e.g. an
+    // ownership receipt) across records; leaving it in corrupts the reassembled frame.
+    if (padding >= 1 && padding <= 16 && bytes.length >= padding
+      && bytes.subarray(bytes.length - padding).every((b) => b === 0xc0 + padding)) {
       bytes = bytes.subarray(0, bytes.length - padding);
     }
     this.pending = concat(this.pending, bytes);

@@ -97,7 +97,13 @@ export class OwnershipCeremony {
     if (this.stage !== "pair") throw new BandProtocolError("The band sent an unexpected ownership response");
     const fields = new ProtoFields(payload);
     const signature = fields.bytes(1);
-    const receipt = Buffer.from(fields.bytes(2)).toString("utf8");
+    // The receipt is signed text that goes to Meta verbatim; refuse to forward a mangled one.
+    let receipt: string;
+    try {
+      receipt = new TextDecoder("utf-8", { fatal: true }).decode(fields.bytes(2));
+    } catch {
+      throw new BandProtocolError("The band's pending ownership receipt arrived corrupted. Try again.");
+    }
     if (receipt.length === 0) throw new BandProtocolError("The band didn't return its pending ownership receipt");
     this.stage = "finishChangeOwner";
     return { receipt, signature };

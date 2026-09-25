@@ -126,11 +126,14 @@ export async function discoverBand(saved: BandDevice, seconds: number): Promise<
   // Remove every cached Meta Band object first. Each button press makes the band advertise a new
   // resolvable-private address, and BlueZ keeps the old objects with a stale RSSI; picking one of
   // those connects to an address the band no longer uses and times out. After removal, only the
-  // address the band is advertising *right now* reappears.
+  // address the band is advertising *right now* reappears. A bonded band is kept: removing it
+  // erases the pairing keys, and the band drops unbonded links after ~30 s.
   for (const [path, ifaces] of await objects()) {
     if (!path.startsWith(adapter + "/dev_")) continue;
-    const device = ifaces.get("org.bluez.Device1") && deviceFrom(ifaces.get("org.bluez.Device1")!);
-    if (device && isBandName(device.name)) {
+    const props = ifaces.get("org.bluez.Device1");
+    const device = props && deviceFrom(props);
+    const bonded = props !== undefined && (getBoolean(props, "Paired") === true || getBoolean(props, "Bonded") === true);
+    if (device && isBandName(device.name) && !bonded) {
       await busctl(["call", "org.bluez", adapter, "org.bluez.Adapter1", "RemoveDevice", "o", path], 10).catch(() => {});
     }
   }

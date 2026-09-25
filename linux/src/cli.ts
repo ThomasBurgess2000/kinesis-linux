@@ -208,17 +208,33 @@ async function enroll(args: string[]): Promise<void> {
   const isTransient = (message: string): boolean =>
     /abort-by-local|took too long|isn't connected or advertising|stream failed|stream ended|services never resolved/i.test(message);
 
+  // Once the band confirms the ownership change it belongs to that key; later attempts reconnect
+  // with it through the enrolled trust flow instead of claiming the band again with a new key.
+  let savedEarly: import("./identity").BandEnrollmentIdentity | undefined;
   for (let attempt = 1; attempt <= 12; attempt++) {
     const connection = new BandConnection(log);
-    const ceremony = new OwnershipCeremony(band.address);
+    const claimed = savedEarly;
+    const sessionOptions = claimed
+      ? { configChannel: config.configChannel, enrollment: claimed }
+      : { configChannel: config.configChannel, ceremony: new OwnershipCeremony(band.address) };
+    if (claimed) console.log(`${stamp()} reconnecting with the new identity to finish trust`);
     let identity: import("./identity").BandEnrollmentIdentity | undefined;
     const outcome = await new Promise<Error | undefined>((resolve) => {
       connection.start(
-        { kind: "connect", band, security: config.security, session: { configChannel: config.configChannel, ceremony }, bond: config.bond, directL2cap: config.directL2cap, psm: config.psm, pairClient },
+        { kind: "connect", band, security: config.security, session: sessionOptions, bond: config.bond, directL2cap: config.directL2cap, psm: config.psm, pairClient },
         (event: BandEvent) => {
           if (event.payload.type === "ceremonyStage") console.log(`${stamp()} enrollment: ${event.payload.message}`);
+          // The band now belongs to the new key. Save it before the trust step, so a failure there
+          // leaves a reconnectable identity instead of a band owned by a discarded key.
+          const adopted = connection.enrolled;
+          if (adopted && adopted !== savedEarly) {
+            savedEarly = adopted;
+            BandIdentity.save(adopted, band.address)
+              .then(() => console.log(`${stamp()} band claimed; identity saved to ${BandIdentity.path(band.address)}`))
+              .catch((error: unknown) => console.error(`${stamp()} couldn't save the new identity: ${error instanceof Error ? error.message : error}`));
+          }
           if (event.payload.type === "connected") {
-            identity = connection.enrolled;
+            identity = connection.enrolled ?? claimed;
             connection.stop();
           }
         },

@@ -78,9 +78,17 @@ export const MetaPair = {
 };
 
 function deviceKeyIn(json: Record<string, unknown>): Uint8Array | undefined {
-  const additional = json.additional_data as { device_ec_public_key?: string } | undefined;
-  const key = additional?.device_ec_public_key;
-  return key ? fromB64(key) : undefined;
+  // The final receipt carries additional_data as a JSON-encoded string, not an object.
+  let additional = json.additional_data;
+  if (typeof additional === "string") {
+    try {
+      additional = JSON.parse(additional);
+    } catch {
+      return undefined;
+    }
+  }
+  const key = (additional as { device_ec_public_key?: unknown } | undefined)?.device_ec_public_key;
+  return typeof key === "string" && key ? fromB64(key) : undefined;
 }
 function deviceKeyInReceipt(receipt: string): Uint8Array | undefined {
   try {
@@ -88,6 +96,30 @@ function deviceKeyInReceipt(receipt: string): Uint8Array | undefined {
   } catch {
     return undefined;
   }
+}
+
+/// Meta's graph error, e.g. ", code 1, subcode 2, "An unknown error occurred", trace AbC". Falls back
+/// to the start of a non-JSON body.
+function errorDetail(json: Record<string, unknown> | undefined, text: string): string {
+  const error = json?.error as { message?: string; code?: number; error_subcode?: number; fbtrace_id?: string } | undefined;
+  if (!error) return text ? `, ${JSON.stringify(text.slice(0, 200))}` : "";
+  return [
+    error.code !== undefined ? `code ${error.code}` : "",
+    error.error_subcode !== undefined ? `subcode ${error.error_subcode}` : "",
+    error.message ? JSON.stringify(error.message) : "",
+    error.fbtrace_id ? `trace ${error.fbtrace_id}` : "",
+  ].filter(Boolean).map((part) => `, ${part}`).join("");
+}
+
+/// KINESIS_DEBUG_PAIR=<file>: append each hardware-graph exchange (access tokens redacted) for
+/// diagnosing claim failures. Receipts are signed claim records, not credentials.
+async function debugDump(url: string, fields: [string, string][], status: number, body: string): Promise<void> {
+  const path = process.env.KINESIS_DEBUG_PAIR;
+  if (!path) return;
+  const redacted = fields.map(([k, v]) => [k, /access_token/.test(k) ? `<redacted ${v.length} chars>` : v]);
+  const file = Bun.file(path);
+  const previous = (await file.exists()) ? await file.text() : "";
+  await Bun.write(path, previous + JSON.stringify({ at: new Date().toISOString(), url, fields: redacted, status, body }) + "\n");
 }
 
 /// The live ownership client; talks to Meta's hardware graph with the account session.
@@ -115,15 +147,12 @@ export class MetaPairClient {
     } catch {
       json = undefined;
     }
+    await debugDump(url, fields, response.status, text);
     if (MetaPair.isSessionFailure(response.status, json?.error as { code?: number } | undefined)) {
       throw new MetaSessionInvalidError("your meta session expired. sign in to claim the band again.");
     }
-    if (response.status !== 200 || !json) {
-      throw new MetaAuthError(`the band claim service failed (http ${response.status}). try again.`);
-    }
-    if (json.error) {
-      const error = json.error as { code?: number };
-      throw new MetaAuthError(`the band claim service rejected the request (code ${error?.code ?? "-"}). try again.`);
+    if (response.status !== 200 || !json || json.error) {
+      throw new MetaAuthError(`the band claim service failed (http ${response.status}${errorDetail(json, text)}). try again.`);
     }
     return json;
   }
