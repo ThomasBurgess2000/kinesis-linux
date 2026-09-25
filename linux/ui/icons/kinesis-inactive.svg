@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" opacity="0.5">
+  <!-- Same glyph, greyed: connected but controls paused, or not connected. -->
+  <ellipse cx="32" cy="32" rx="24" ry="15" fill="none" stroke="#7f8c8d" stroke-width="7"/>
+  <rect x="21" y="11" width="22" height="14" rx="5" fill="#7f8c8d"/>
+  <circle cx="32" cy="18" r="2.6" fill="#fcfcfc"/>
+</svg>
