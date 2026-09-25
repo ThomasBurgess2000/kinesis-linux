@@ -225,6 +225,13 @@ export class BandConnection {
     const path = await bluez.characteristicPath(device, bluez.PSM_CHARACTERISTIC);
     if (!path) throw new KinesisError("This band doesn't expose the L2CAP PSM characteristic");
     let value: Uint8Array;
+    // A read that hangs is waiting on the desktop's pairing prompt; say so, and give the person
+    // the band's ~30 s pairing window to accept it.
+    const pending = setTimeout(() => {
+      this.log.notice("Waiting for the Bluetooth pairing request to be accepted");
+      this.deadline = Math.max(this.deadline, now() + 35);
+      this.emit({ payload: { type: "systemPairingPending" }, receivedAt: now() });
+    }, 1500);
     try {
       value = await bluez.readCharacteristic(path);
     } catch (error) {
@@ -234,6 +241,8 @@ export class BandConnection {
       this.log.notice("The band wants a bonded link; pairing through BlueZ");
       await bluez.pair(device);
       value = await bluez.readCharacteristic(path);
+    } finally {
+      clearTimeout(pending);
     }
     if (value.length !== 2) throw new KinesisError("The band reported an unexpected PSM value");
     // Observed firmware answers ff 00: PSM 255 little-endian.
@@ -263,7 +272,10 @@ export class BandConnection {
       const wasAuthenticated = session.authenticatedPackets > 0;
       const result = session.feed(bytes, time);
       if (!wasAuthenticated && session.authenticatedPackets > 0) this.log.info(`Encrypted packet verified (band params offered ${session.offeredParams}, band sends ${session.negotiatedParams}, we send ${session.declaredParams})`);
-      if (!wasEnabled && session.streamsEnabled) this.log.notice("Band acknowledged gesture and motion subscription");
+      if (!wasEnabled && session.streamsEnabled) {
+        this.log.notice("Band acknowledged gesture and motion subscription");
+        this.emit({ payload: { type: "subscribed" }, receivedAt: time });
+      }
       // One AirShield record per SDU: the band's framing does not reassemble across writes.
       for (const packet of result.packets) this.channel?.write(packet);
       for (const event of result.events) {

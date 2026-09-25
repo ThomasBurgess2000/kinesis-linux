@@ -29,6 +29,36 @@ export interface ActionResult {
   error?: string;
 }
 
+/// How late band data arrives, against the band's own clock: the smallest host-minus-band offset
+/// seen (drifting up slowly) is the on-time baseline. Port of AirCursor.swift's ArrivalDelay.
+export class ArrivalDelay {
+  private baseline: number | undefined;
+  private lastBand: number | undefined;
+  private lastHost: number | undefined;
+
+  measure(band: number, host: number): number {
+    if (!Number.isFinite(band) || !Number.isFinite(host)) return 0;
+    // The band's clock restarted, so the old baseline no longer applies.
+    if (this.lastBand !== undefined && band < this.lastBand - 1) this.reset();
+    const offset = host - band;
+    this.baseline = this.baseline !== undefined && this.lastHost !== undefined
+      ? Math.min(this.baseline + Math.max(0, host - this.lastHost) * 0.0005, offset)
+      : offset;
+    this.lastBand = band;
+    this.lastHost = host;
+    return Math.max(0, offset - this.baseline);
+  }
+
+  reset(): void {
+    this.baseline = undefined;
+    this.lastBand = undefined;
+    this.lastHost = undefined;
+  }
+}
+
+/// Motion arriving later than this means the radio link is falling behind.
+export const LATE_INPUT = 0.3;
+
 export interface ControllerState {
   phase: string;
   status: ControllerStatus;
@@ -47,6 +77,12 @@ export interface ControllerState {
   dialEngaged: boolean;
   pinchedFinger: string | undefined;
   error: string | undefined;
+  /// The link is up but sensor frames aren't flowing (off the wrist, or on the charger?).
+  streamHint: string | undefined;
+  /// Band data has been arriving late for a while: the radio link is congested.
+  linkCongested: boolean;
+  /// The desktop is showing a Bluetooth pairing request to accept.
+  awaitingSystemPairing: boolean;
 }
 
 export interface ControllerHooks {
@@ -65,6 +101,7 @@ export class Controller {
     charging: undefined, bandHand: "right",
     handConfirmed: false, pendingHand: undefined, handSettingError: undefined, lastGesture: "Waiting for a gesture",
     lastAction: "Controls are paused", gestureCount: 0, dialEngaged: false, pinchedFinger: undefined, error: undefined,
+    streamHint: undefined, linkCongested: false, awaitingSystemPairing: false,
   };
   private wantsConnection = false;
   private busy = false;
@@ -84,6 +121,16 @@ export class Controller {
   private band: BandDevice | undefined;
   private enableWhenLive = false;
   private enrollment: BandEnrollmentIdentity | undefined;
+  // Sensor-stream health, as the Mac app tracks it: status replies prove the link is alive, not
+  // that its sensors are flowing.
+  private lastSensorAt: number | undefined;
+  private sensorHealthySince: number | undefined;
+  private subscribedAt: number | undefined;
+  private sensorRecoveryUsed = false;
+  private sensorRecoveryPending = false;
+  private readonly arrival = new ArrivalDelay();
+  private linkLateSince: number | undefined;
+  private linkOnTimeSince: number | undefined;
 
   constructor(
     private config: Config,
@@ -115,6 +162,7 @@ export class Controller {
     this.wantsConnection = true;
     this.enableWhenLive = options.enableControls;
     this.retries = 0;
+    this.sensorRecoveryUsed = false;
     this.ticker ??= setInterval(() => this.tick(), 500);
     this.run(this.connectOperation(band));
   }
@@ -247,6 +295,16 @@ export class Controller {
     this.started = this.clock();
     this.router.reset();
     this.suspendActions();
+    this.lastSensorAt = undefined;
+    this.sensorHealthySince = undefined;
+    this.subscribedAt = undefined;
+    this.sensorRecoveryPending = false;
+    this.arrival.reset();
+    this.linkLateSince = undefined;
+    this.linkOnTimeSince = undefined;
+    this.state.streamHint = undefined;
+    this.state.linkCongested = false;
+    this.state.awaitingSystemPairing = false;
     this.connection.start(operation, (event) => this.receive(event), (error) => this.connectionEnded(error))
       .catch((error: unknown) => this.connectionEnded(error instanceof Error ? error : new Error(String(error))));
   }
@@ -302,7 +360,19 @@ export class Controller {
       case "preparing":
         this.setPhase("Preparing…", "connecting");
         break;
+      case "motion":
+        this.markDataArrived(event.receivedAt);
+        this.measureLinkDelay(payload.bandTimeUs, event.receivedAt);
+        break;
+      case "subscribed":
+        this.subscribedAt = time;
+        break;
+      case "systemPairingPending":
+        this.state.awaitingSystemPairing = true;
+        this.changed();
+        break;
       case "connected":
+        this.state.awaitingSystemPairing = false;
         this.setPhase("Connected", "connected");
         this.retries = 0;
         this.state.error = undefined;
@@ -420,23 +490,88 @@ export class Controller {
     }
   }
 
+  /// Sensor frames are flowing, so the no-data hint no longer applies.
+  private markDataArrived(time: number): void {
+    if (!this.wantsConnection || this.sleeping || this.sensorRecoveryPending) return;
+    if (Math.abs(this.clock() - time) >= 0.6 || time < (this.lastSensorAt ?? time)) return;
+    if (this.lastSensorAt === undefined || time - this.lastSensorAt > 1) this.sensorHealthySince = time;
+    this.lastSensorAt = time;
+    // A brief burst after reconnecting is not a recovered stream: require sustained data before
+    // allowing another automatic sensor recovery.
+    if (this.sensorHealthySince !== undefined && time - this.sensorHealthySince >= 30) this.sensorRecoveryUsed = false;
+    this.subscribedAt = undefined;
+    if (this.state.streamHint !== undefined) {
+      this.state.streamHint = undefined;
+      this.changed();
+    }
+  }
+
+  /// Late for a second running means congested; clear again after two seconds on time.
+  private measureLinkDelay(bandTimeUs: bigint, host: number): void {
+    const delay = this.arrival.measure(Number(bandTimeUs) / 1e6, host);
+    if (delay > LATE_INPUT) {
+      this.linkOnTimeSince = undefined;
+      this.linkLateSince ??= host;
+      if (host - this.linkLateSince >= 1 && !this.state.linkCongested) {
+        this.state.linkCongested = true;
+        this.log.notice(`Band data is arriving ${delay.toFixed(2)}s late; the radio link is congested`);
+        this.changed();
+      }
+    } else {
+      this.linkLateSince = undefined;
+      this.linkOnTimeSince ??= host;
+      if (this.state.linkCongested && host - this.linkOnTimeSince >= 2) {
+        this.state.linkCongested = false;
+        this.log.notice("Band data is on time again");
+        this.changed();
+      }
+    }
+  }
+
+  /// Status replies prove the link is alive, not that its sensors are flowing.
+  private evaluateStreamHint(now: number): void {
+    const lastData = this.lastSensorAt ?? this.subscribedAt;
+    if (!this.busy || this.sensorRecoveryPending || lastData === undefined || now - lastData < 10) return;
+    const hint = this.lastSensorAt === undefined
+      ? "Subscribed but no data. Is the band on your wrist and off the charger?"
+      : "The sensor stream is quiet. Is the band on your wrist and off the charger?";
+    if (this.state.streamHint === hint) return;
+    if (this.state.streamHint === undefined) {
+      this.log.notice(`No sensor frames for ${(now - lastData).toFixed(1)}s; charging: ${this.state.charging ?? "unknown"}`);
+    }
+    this.state.streamHint = hint;
+    this.changed();
+  }
+
+  /// One watchdog, and at most one stop per recovery. The link is dead when nothing at all
+  /// arrives. Sensors are stalled when status replies still arrive but motion does not; that
+  /// recovery is budgeted, because an off-wrist band legitimately goes quiet and must not
+  /// reconnect forever.
   private tick(): void {
-    if (!this.wantsConnection || !this.busy) return;
-    const silentFor = this.clock() - (this.heartbeat ?? this.started);
+    const now = this.clock();
+    this.evaluateStreamHint(now);
+    if (!this.wantsConnection || !this.busy || this.sleeping || this.sensorRecoveryPending) return;
+    const silentFor = now - (this.heartbeat ?? this.started);
     // KINESIS_STALL overrides the 8 s no-input teardown (diagnostics: see whether the band is
     // still answering status queries before we tear the session down ourselves).
     const stallAfter = Number(process.env.KINESIS_STALL ?? 8);
     // Before the first heartbeat, allow the whole discovery window plus connect/handshake time,
     // otherwise a long KINESIS_DISCOVER gets chopped into 50 s restarts with gaps between them.
     const startupAllowance = Math.max(50, Number(process.env.KINESIS_DISCOVER ?? 60) + 40);
-    if (silentFor > (this.heartbeat === undefined ? startupAllowance : stallAfter)) {
-      if (this.state.live) {
-        this.state.live = false;
-        this.suspendActions();
-        this.setPhase("Connection stalled. Reconnecting…", "reconnecting");
-        this.log.notice(`No band input for ${silentFor.toFixed(1)}s; reconnecting`);
-      }
-      this.connection.stop();
+    const linkDead = silentFor > (this.heartbeat === undefined ? startupAllowance : stallAfter);
+    const sensorsStalled = !this.sensorRecoveryUsed && this.state.charging !== true && this.lastSensorAt !== undefined
+      && now - this.lastSensorAt > 10;
+    if (!linkDead && !sensorsStalled) return;
+    if (!linkDead) this.sensorRecoveryUsed = true;
+    this.sensorRecoveryPending = true;
+    if (this.state.live) {
+      this.state.live = false;
+      this.suspendActions();
     }
+    this.setPhase(linkDead ? "Connection stalled. Reconnecting…" : "Reconnecting…", "reconnecting");
+    this.log.notice(linkDead
+      ? `No band input for ${silentFor.toFixed(1)}s; reconnecting`
+      : `No sensor frames for ${(now - (this.lastSensorAt ?? now)).toFixed(1)}s; reconnecting once`);
+    this.connection.stop();
   }
 }

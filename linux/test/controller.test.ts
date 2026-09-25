@@ -132,3 +132,78 @@ test("disconnect stops the connection and stays disconnected", async () => {
   expect(controller.state.phase).toBe("Disconnected");
   expect(controller.state.live).toBe(false);
 });
+
+function motion(time: number, bandSeconds: number): BandEvent {
+  return { payload: { type: "motion", bandTimeUs: BigInt(Math.round(bandSeconds * 1e6)) }, receivedAt: time };
+}
+
+test("a quiet sensor stream shows a hint and reconnects once; data clears the hint", async () => {
+  const { controller, connection, clock } = await setup();
+  connection.emit!(motion(100, 5));
+  // Status replies keep the link alive, but no motion arrives: at 10 s the hint shows...
+  for (let t = 101; t <= 110; t += 0.5) {
+    clock.now = t;
+    connection.emit!({ payload: { type: "heartbeat" }, receivedAt: t });
+    controller["tick"]();
+  }
+  expect(controller.state.streamHint).toContain("on your wrist");
+  expect(connection.stopped).toBe(0);
+  // ...and just past it, the one budgeted recovery reconnects.
+  clock.now = 110.6;
+  connection.emit!({ payload: { type: "heartbeat" }, receivedAt: 110.6 });
+  controller["tick"]();
+  expect(connection.stopped).toBe(1);
+  expect(controller.state.status).toBe("reconnecting");
+  controller["tick"]();
+  expect(connection.stopped).toBe(1);
+  await controller.disconnect();
+});
+
+test("after the recovery is spent, a still-quiet band is not reconnected again", async () => {
+  const { controller, connection, clock } = await setup();
+  controller["sensorRecoveryUsed"] = true;
+  connection.emit!(motion(100, 5));
+  for (let t = 101; t <= 125; t += 0.5) {
+    clock.now = t;
+    connection.emit!({ payload: { type: "heartbeat" }, receivedAt: t });
+    controller["tick"]();
+  }
+  expect(connection.stopped).toBe(0);
+  expect(controller.state.streamHint).toBeDefined();
+  clock.now = 125.2;
+  connection.emit!(motion(125.2, 30.2));
+  expect(controller.state.streamHint).toBeUndefined();
+  await controller.disconnect();
+});
+
+test("late band data marks the link congested, and on-time data clears it", async () => {
+  const { controller, connection, clock } = await setup();
+  // On time: host and band clocks advance together.
+  for (let i = 0; i <= 10; i++) {
+    clock.now = 100 + i * 0.1;
+    connection.emit!(motion(clock.now, 5 + i * 0.1));
+  }
+  expect(controller.state.linkCongested).toBe(false);
+  // Then 0.5 s late for over a second.
+  for (let i = 1; i <= 14; i++) {
+    clock.now = 101 + i * 0.1;
+    connection.emit!(motion(clock.now, 6 + i * 0.1 - 0.5));
+  }
+  expect(controller.state.linkCongested).toBe(true);
+  // Back on time for two seconds.
+  for (let i = 1; i <= 21; i++) {
+    clock.now = 102.4 + i * 0.1;
+    connection.emit!(motion(clock.now, 7.4 + i * 0.1));
+  }
+  expect(controller.state.linkCongested).toBe(false);
+  await controller.disconnect();
+});
+
+test("a pending desktop pairing request shows until the band connects", async () => {
+  const { controller, connection, clock } = await setup();
+  connection.emit!({ payload: { type: "systemPairingPending" }, receivedAt: clock.now });
+  expect(controller.state.awaitingSystemPairing).toBe(true);
+  connection.emit!({ payload: { type: "connected" }, receivedAt: clock.now });
+  expect(controller.state.awaitingSystemPairing).toBe(false);
+  await controller.disconnect();
+});

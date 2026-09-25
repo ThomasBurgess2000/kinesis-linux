@@ -31,6 +31,12 @@ export type BandEventPayload =
   | { type: "connected" }
   | { type: "disconnected" }
   | { type: "heartbeat" }
+  /// One motion (gyro or orientation) frame, stamped with the band's own clock.
+  | { type: "motion"; bandTimeUs: bigint }
+  /// The band acknowledged the sensor subscription (data may still be on its way).
+  | { type: "subscribed" }
+  /// The desktop is showing a Bluetooth pairing prompt the person has to accept.
+  | { type: "systemPairingPending" }
   | { type: "gesture"; gesture: BandGesture }
   | { type: "dialState"; engaged: boolean }
   | { type: "dialTurn"; rotation: number }

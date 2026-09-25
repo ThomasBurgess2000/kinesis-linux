@@ -590,6 +590,7 @@ export class BandSession {
     }
     const bytes = fields.bytes(3, kind === 0x0200020f ? 6 : 16);
     this.motionMessages += 1;
+    events.push(event({ type: "motion", bandTimeUs: timestamp }, time));
     if (!this.streaming) {
       this.streaming = true;
       events.push(event({ type: "connected" }, time));

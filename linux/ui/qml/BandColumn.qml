@@ -19,7 +19,11 @@ ColumnLayout {
         if (ctl.live && !ctl.controlsEnabled) return "Connected · controls paused";
         return ctl.phase || "";
     }
+    // One notice at a time, in the Mac app's order.
     readonly property string notice: {
+        if (ctl.awaitingSystemPairing) return "Accept the Bluetooth request";
+        if (ctl.streamHint) return ctl.streamHint;
+        if (ctl.linkCongested) return "Weak signal · data arrives late";
         if (ctl.battery !== undefined && ctl.battery !== null && ctl.battery <= 15 && !ctl.charging) return "Low battery";
         if (column.working && !ctl.live) return "Press the band's button if it doesn't connect";
         return "";
@@ -69,13 +73,12 @@ ColumnLayout {
         }
     }
 
-    Kirigami.Chip {
-        Layout.alignment: Qt.AlignHCenter
+    Kirigami.InlineMessage {
+        Layout.fillWidth: true
         visible: column.notice !== ""
         text: column.notice
-        closable: false
-        checkable: false
-        icon.name: "dialog-information"
+        type: column.ctl.awaitingSystemPairing || column.ctl.linkCongested || column.ctl.streamHint
+            ? Kirigami.MessageType.Warning : Kirigami.MessageType.Information
     }
 
     QQC2.Button {
