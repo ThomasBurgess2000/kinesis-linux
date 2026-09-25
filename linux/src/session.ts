@@ -13,6 +13,7 @@ import { AirShieldCipher, AirShieldKeys, AirShieldReceiver, airShieldParams, mac
 import { OwnershipCeremony, ceremonyFailureMessage } from "./ceremony";
 import { PinchDial } from "./dial";
 import { type BandEnrollmentIdentity, BandIdentityMismatchError, verifyPreimage } from "./identity";
+import { parseEMGConfiguration } from "./emg";
 import type { BandEvent, BandGesture, BandHand } from "./gestures";
 import { BandProtocolError, BandWire, DataXReceiver, type DataXFrame, ProtoFields, be16, be32, concat } from "./wire";
 
@@ -27,7 +28,11 @@ export interface SessionOptions {
   configChannel?: number;
   enrollment?: BandEnrollmentIdentity;
   ceremony?: OwnershipCeremony;
+  /// Turn raw sEMG on as soon as the input subscription is up (readings were on before a reconnect).
+  rawEMG?: boolean;
 }
+
+type RawStage = "config" | "query" | "update";
 
 /// Whether two DataX channels are the same channel. Newer firmware tags its channels with
 /// per-connection high bits (0x9801 answering our 0x8001, 0x9802 for its proof), so compare the
@@ -121,6 +126,15 @@ export class BandSession {
   private batteryRequestID = 0n;
   private batteryRequest: { id: bigint; deadline: number } | undefined;
   private batteryUnavailable = false;
+  // Raw sEMG rides on the input subscription (flag 2), after reading the EMG config on 0x8007.
+  private readonly configServiceChannel = 0x8007;
+  private configServiceOpened = false;
+  private rawEMG: boolean;
+  private rawRequested = false;
+  private rawRequestID = 6n;
+  private rawRequest: { enabled: boolean; stage: RawStage; id: bigint; deadline: number } | undefined;
+  rawEMGFrames = 0;
+  rawEMGBytes = 0;
   hand: BandHand | undefined;
 
   onFrame: ((frame: { channel: number; words: number[]; length: number }) => void) | undefined;
@@ -132,6 +146,7 @@ export class BandSession {
     this.configurationChannel = options.configChannel ?? 0x8006;
     this.enrollment = options.enrollment;
     this.ceremony = options.ceremony;
+    this.rawEMG = options.rawEMG ?? false;
   }
 
   private get publicKey(): Uint8Array {
@@ -252,7 +267,79 @@ export class BandSession {
       this.batteryRequest = undefined;
       events.push(event({ type: "batteryStatus", status: undefined }, time));
     }
+    if (this.rawRequest && time >= this.rawRequest.deadline && !this.stopping) {
+      this.rawRequest = undefined;
+      events.push(event({ type: "rawEMGFailure", message: "The band didn't confirm the EMG change. Turn readings off, then try again." }, time));
+    }
     return events;
+  }
+
+  /// Turn raw sEMG on or off on the running subscription; gestures and motion stay on. On: read
+  /// the EMG config, query the stream, then update it with flag 2. Off: update it directly.
+  /// Before the subscription is up this only records the wish (see SessionOptions.rawEMG).
+  setRawEMGEnabled(enabled: boolean, time: number): Uint8Array {
+    if (this.stopping) throw new BandProtocolError("Wait for the band to reconnect before changing readings.");
+    if (this.rawRequest) throw new BandProtocolError("Wait for the current EMG change to finish.");
+    this.rawEMG = enabled;
+    if (!this.streamsEnabled) return new Uint8Array();
+    this.rawRequestID += 1n;
+    this.rawRequest = { enabled, stage: enabled ? "config" : "update", id: this.rawRequestID, deadline: time + 8 };
+    if (enabled) {
+      const words = this.configServiceOpened ? [] : [0x8100ce56, 0x02000314];
+      this.configServiceOpened = true;
+      return this.encrypt(BandWire.frame(this.configServiceChannel, words,
+        concat(BandWire.field(1, this.rawRequestID), BandWire.field(5, new Uint8Array()))));
+    }
+    return this.rawStreamUpdate(this.rawRequestID, false);
+  }
+
+  /// Every stream field set explicitly, so none is left to the band's default.
+  private rawStreamUpdate(id: bigint, enabled: boolean): Uint8Array {
+    this.rawRequested = true;
+    const control = concat(BandWire.field(2, enabled ? 1 : 0), ...this.streamFields.map((field) => BandWire.field(field, 1)));
+    return this.encrypt(BandWire.frame(this.streamChannel, [], concat(BandWire.field(1, id), BandWire.field(4, control))));
+  }
+
+  private receiveRaw(frame: DataXFrame, fields: ProtoFields, time: number, outgoing: Uint8Array[]): BandEvent[] | undefined {
+    const pending = this.rawRequest;
+    if (!pending) return undefined;
+    const expected = pending.stage === "config" ? this.configServiceChannel : this.streamChannel;
+    if (!sameChannel(frame.channel, expected) || fields.integer(1) !== pending.id) return undefined;
+    if (fields.integer(2) !== 1n) {
+      this.rawRequest = undefined;
+      return [event({ type: "rawEMGFailure", message: "The band rejected the EMG change. Gestures remain requested." }, time)];
+    }
+    switch (pending.stage) {
+      case "config": {
+        let config;
+        try {
+          config = parseEMGConfiguration(frame.payload);
+        } catch {
+          this.rawRequest = undefined;
+          return [event({ type: "rawEMGFailure", message: "The band didn't provide a readable EMG configuration." }, time)];
+        }
+        this.rawRequestID += 1n;
+        this.rawRequest = { ...pending, stage: "query", id: this.rawRequestID };
+        outgoing.push(this.streamRequest(this.rawRequestID, undefined));
+        return [event({ type: "rawEMGConfiguration", config }, time)];
+      }
+      case "query":
+        this.rawRequestID += 1n;
+        this.rawRequest = { ...pending, stage: "update", id: this.rawRequestID };
+        outgoing.push(this.rawStreamUpdate(this.rawRequestID, pending.enabled));
+        return [];
+      case "update": {
+        this.rawRequest = undefined;
+        const flags = new ProtoFields(fields.bytes(5));
+        if (!this.streamFields.every((f) => flags.integer(f) === 1n)) {
+          throw new BandProtocolError("The band stopped gesture streams during the EMG change. Reconnect with readings off.");
+        }
+        if (flags.integer(2) !== (pending.enabled ? 1n : 0n)) {
+          return [event({ type: "rawEMGFailure", message: "The band didn't accept EMG alongside gestures." }, time)];
+        }
+        return [event({ type: "rawEMGState", enabled: pending.enabled }, time)];
+      }
+    }
   }
 
   /// BatteryInfoReq: an empty read on its own service channel, separate from the sensor
@@ -342,7 +429,7 @@ export class BandSession {
     this.stopping = true;
     this.handRequest = undefined;
     if (!this.transmitter || this.setupStage !== "input") return new Uint8Array();
-    return this.streamRequest(4n, false);
+    return this.streamRequest(4n, false, this.rawRequested);
   }
 
   private encrypt(data: Uint8Array): Uint8Array {
@@ -456,10 +543,12 @@ export class BandSession {
     return [];
   }
 
-  private streamRequest(id: bigint, enabled: boolean | undefined): Uint8Array {
+  /// `includeRaw` also sets raw sEMG (flag 2), once it has been requested this session.
+  private streamRequest(id: bigint, enabled: boolean | undefined, includeRaw = false): Uint8Array {
+    const fields = includeRaw ? [2, ...this.streamFields] : this.streamFields;
     const control = enabled === undefined
       ? new Uint8Array()
-      : concat(...this.streamFields.map((field) => BandWire.field(field, enabled ? 1 : 0)));
+      : concat(...fields.map((field) => BandWire.field(field, enabled ? 1 : 0)));
     return this.encrypt(BandWire.frame(this.streamChannel, id === 2n ? [0x8100ce56, 0x02000314] : [],
       concat(BandWire.field(1, id), BandWire.field(4, control))));
   }
@@ -520,6 +609,10 @@ export class BandSession {
       return [];
     }
     if (kind === 0x0300c001 && !this.stopping) {
+      if (this.rawRequest && (sameChannel(frame.channel, 7) || (sameChannel(frame.channel, 5) && this.rawRequest.stage !== "config"))) {
+        this.rawRequest = undefined;
+        return [event({ type: "rawEMGFailure", message: "The band rejected the EMG request." }, time)];
+      }
       if (sameChannel(frame.channel, 3) && this.setupStage === "deviceInfo") {
         throw new BandProtocolError("The band rejected gesture setup. Try reconnecting.");
       }
@@ -533,7 +626,7 @@ export class BandSession {
       }
       return [];
     }
-    if (![0x02000315, 0x0200020d, 0x0200020f, 0x02000212].includes(kind)) return [];
+    if (![0x02000315, 0x0200020a, 0x0200020d, 0x0200020f, 0x02000212].includes(kind)) return [];
     if (kind === 0x02000315 && sameChannel(frame.channel, 3) && this.setupStage === "deviceInfo" && !this.stopping) {
       const fields = new ProtoFields(frame.payload);
       if (fields.requiredInteger(1) !== 1n) return [];
@@ -549,8 +642,12 @@ export class BandSession {
       if (this.stopping) return [];
       return this.receiveHand(new ProtoFields(frame.payload), time, outgoing);
     }
-    if (kind === 0x02000315 && !sameChannel(frame.channel, this.streamChannel)) return [];
     const fields = new ProtoFields(frame.payload);
+    if (kind === 0x02000315 && !this.stopping) {
+      const raw = this.receiveRaw(frame, fields, time, outgoing);
+      if (raw) return raw;
+    }
+    if (kind === 0x02000315 && !sameChannel(frame.channel, this.streamChannel)) return [];
     if (kind === 0x02000315) {
       const request = fields.integer(1);
       if (request === 3n || request === 5n) {
@@ -559,17 +656,33 @@ export class BandSession {
         const flags = new ProtoFields(fields.bytes(5));
         this.streamsEnabled = this.streamFields.every((f) => flags.contains(f) && flags.integer(f) === 1n);
         if (!this.streamsEnabled) throw new BandProtocolError("The band input subscription stopped");
+        if (request === 3n && this.rawEMG && !this.rawRequest) outgoing.push(this.setRawEMGEnabled(true, time));
         if (!this.streaming) {
           this.streaming = true;
           return [event({ type: "connected" }, time)];
         }
       } else if (request === 4n && fields.integer(2) === 1n && fields.contains(5)) {
         const flags = new ProtoFields(fields.bytes(5));
-        this.stopAcknowledged = this.streamFields.every((f) => flags.contains(f) && flags.integer(f) === 0n);
+        const stopped = this.rawRequested ? [2, ...this.streamFields] : this.streamFields;
+        this.stopAcknowledged = stopped.every((f) => flags.contains(f) && flags.integer(f) === 0n);
       }
       return [];
     }
     if (this.stopping) return [];
+    if (kind === 0x0200020a) {
+      // Keep the original payload for recordings, including unknown encodings.
+      this.rawEMGFrames += 1;
+      this.rawEMGBytes += frame.payload.length;
+      const events: BandEvent[] = [];
+      if (!this.streaming) {
+        this.streaming = true;
+        events.push(event({ type: "connected" }, time));
+        events.push(event({ type: "heartbeat" }, time));
+        this.lastHeartbeat = time;
+      }
+      events.push(event({ type: "rawEMGFrame", payload: frame.payload }, time));
+      return events;
+    }
     const sequence = fields.requiredInteger(1);
     const timestamp = fields.requiredInteger(2);
     const events: BandEvent[] = [];

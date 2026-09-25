@@ -13,7 +13,7 @@ import { ALL_ACTIONS, type ActionBackend, backendFor } from "./actions";
 import * as bluez from "./bluez";
 import { type Config, ConfigError, applyConfigPatch, configPath, loadConfig, saveConfig } from "./config";
 import { BandConnection, KinesisError, type Logger } from "./connection";
-import { type ActionResult, type ConnectionLike, Controller, type ControllerState } from "./controller";
+import { type ActionResult, type ConnectionLike, Controller, type ControllerState, type ReadingsState } from "./controller";
 import { type DoctorRow, doctorRows } from "./doctor";
 import { type PairStep, PairingCancelled, claimBand, findBand, isWrongAccount, obtainMetaSession } from "./enroll";
 import {
@@ -23,6 +23,7 @@ import {
 import { BandIdentity } from "./identity";
 import { MetaSessionStore } from "./meta-auth";
 import { MetaSessionInvalidError } from "./meta-pair";
+import { EMGReadings, RawRecorder, type ReadingsStats } from "./readings";
 import { watchSleep } from "./sleep";
 
 /// Counters that outlive a session (the Mac app keeps them in UserDefaults).
@@ -68,6 +69,8 @@ export interface DaemonState {
   startAutomatically: boolean;
   /// Every gesture recognized since the app was set up, across sessions.
   totalGestures: number;
+  developerMode: boolean;
+  readings: ReadingsState & ReadingsStats & { recording: { path: string; frames: number } | null };
 }
 
 /// The pairing steps, swappable in tests.
@@ -119,6 +122,11 @@ export class Daemon {
   private stopWatchingSleep: (() => void) | undefined;
   private totalGestures = 0;
   private statsTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly readings = new EMGReadings();
+  private readingsConfig: unknown;
+  private recorder: RawRecorder | undefined;
+  private emgTimer: ReturnType<typeof setInterval> | undefined;
+  private emgTicks = 0;
 
   constructor(private readonly options: DaemonOptions = {}) {
     this.path = options.socketPath ?? socketPath();
@@ -139,7 +147,16 @@ export class Daemon {
     this.backend = this.makeBackend(this.config);
     const connection = this.options.connection ?? new BandConnection(this.log);
     this.controller = new Controller(this.config, connection, this.backend, this.log, {
-      onState: () => this.stateChanged(),
+      onState: () => {
+        const config = this.controller.state.readings.config;
+        if (config && config !== this.readingsConfig) this.readings.configure(config);
+        this.readingsConfig = config;
+        this.stateChanged();
+      },
+      onRawEMG: (payload, receivedAt) => {
+        this.readings.receive(payload);
+        this.recorder?.record(payload, receivedAt);
+      },
       onGesture: (gesture) => this.gestured(gesture),
       onAction: (result) => this.broadcast("action", result satisfies ActionResult),
       onDial: (delta) => this.broadcast("dial", { delta }),
@@ -148,6 +165,9 @@ export class Daemon {
     }, this.options.clock);
     await this.refreshAccount();
     await this.loadStats();
+    // Live EMG is a developer-mode feature; its last setting comes back with it.
+    this.controller.setRawEMG(this.config.developerMode && this.config.rawEMG);
+    this.emgTimer = setInterval(() => this.pushReadings(), 50);
 
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     chmodSync(dirname(this.path), 0o700);
@@ -174,6 +194,8 @@ export class Daemon {
 
   async stop(): Promise<void> {
     this.stopWatchingSleep?.();
+    if (this.emgTimer) clearInterval(this.emgTimer);
+    await this.stopRecording();
     if (this.statsTimer) {
       clearTimeout(this.statsTimer);
       await this.saveStats();
@@ -199,7 +221,52 @@ export class Daemon {
       setupDone: this.config.setupDone,
       startAutomatically: this.config.startAutomatically,
       totalGestures: this.totalGestures,
+      developerMode: this.config.developerMode,
+      readings: {
+        ...structuredClone(this.controller.state.readings),
+        ...this.readings.stats(this.clock()),
+        recording: this.recorder ? { path: this.recorder.path, frames: this.recorder.frames } : null,
+      },
     };
+  }
+
+  private clock(): number {
+    return (this.options.clock ?? (() => Number(Bun.nanoseconds()) / 1e9))();
+  }
+
+  /// New EMG batches go to viewers about 20 times a second, and recordings are flushed twice a second.
+  private pushReadings(): void {
+    this.emgTicks += 1;
+    if (this.recorder && this.emgTicks % 10 === 0) this.recorder.flush();
+    const { restart, batches } = this.readings.take();
+    if (!restart && batches.length === 0) return;
+    this.broadcast("emg", {
+      restart,
+      batches: batches.map((b) => ({ sequence: b.sequence.toString(), timestampUs: Number(b.timestampUs), values: b.values })),
+    });
+    this.stateChanged();
+  }
+
+  private async startRecording(path: unknown): Promise<void> {
+    if (typeof path !== "string" || !path.startsWith("/")) throw new DaemonError("Choose where to save the recording.");
+    if (!this.controller.state.readings.active) throw new DaemonError("Turn on live EMG before recording.");
+    await this.stopRecording();
+    try {
+      this.recorder = new RawRecorder(path);
+    } catch (error) {
+      throw new DaemonError(`Couldn't write to ${path}: ${messageOf(error)}`);
+    }
+    this.log.notice(`Raw EMG capture started: ${path}`);
+    this.stateChanged();
+  }
+
+  private async stopRecording(): Promise<void> {
+    const recorder = this.recorder;
+    if (!recorder) return;
+    this.recorder = undefined;
+    await recorder.close();
+    this.log.notice(`Raw EMG capture saved: ${recorder.frames} batches to ${recorder.path}`);
+    this.stateChanged();
   }
 
   /// One request from a client. Exposed for tests; the socket path goes through received().
@@ -234,6 +301,8 @@ export class Daemon {
       case "signOut": await MetaSessionStore.delete(); await this.refreshAccount(); this.stateChanged(); return this.state();
       case "forget": await this.forget(); return this.state();
       case "logs": return this.logLines;
+      case "startRecording": await this.startRecording(params.path); return this.state();
+      case "stopRecording": await this.stopRecording(); return this.state();
       default: throw new DaemonError(`Unknown method "${method}"`);
     }
   }
@@ -254,7 +323,13 @@ export class Daemon {
       throw error;
     }
     const backendChanged = next.backend !== this.config.backend || JSON.stringify(next.commands) !== JSON.stringify(this.config.commands);
+    const wantsEMG = next.developerMode && next.rawEMG;
+    const emgChanged = wantsEMG !== (this.config.developerMode && this.config.rawEMG);
     this.config = next;
+    if (emgChanged) {
+      if (!wantsEMG) await this.stopRecording();
+      this.controller.setRawEMG(wantsEMG);
+    }
     if (backendChanged) this.backend = this.makeBackend(next);
     this.controller.updateConfig(next, backendChanged ? this.backend : undefined);
     await saveConfig(next, this.configFile);

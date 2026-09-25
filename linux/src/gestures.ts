@@ -2,6 +2,7 @@
 // Port of Sources/KinesisCore/Gestures.swift with MacAction generalised to Action.
 
 import type { CeremonyHTTPRequest } from "./ceremony";
+import type { EMGConfiguration } from "./emg";
 
 export type BandHand = "right" | "left";
 
@@ -37,6 +38,11 @@ export type BandEventPayload =
   | { type: "subscribed" }
   /// The desktop is showing a Bluetooth pairing prompt the person has to accept.
   | { type: "systemPairingPending" }
+  /// Raw sEMG: the band's configuration, an accepted on/off change, a refused one, and each batch.
+  | { type: "rawEMGConfiguration"; config: EMGConfiguration }
+  | { type: "rawEMGState"; enabled: boolean }
+  | { type: "rawEMGFailure"; message: string }
+  | { type: "rawEMGFrame"; payload: Uint8Array }
   | { type: "gesture"; gesture: BandGesture }
   | { type: "dialState"; engaged: boolean }
   | { type: "dialTurn"; rotation: number }

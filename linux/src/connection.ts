@@ -142,6 +142,16 @@ export class BandConnection {
     this.log.notice(`Requested band hand: ${hand}`);
   }
 
+  /// Turn raw sEMG on or off on the live subscription (gestures stay on).
+  setRawEMG(enabled: boolean): void {
+    if (!this.session || this.stopping || this.disconnecting || !this.channel) {
+      throw new KinesisError("Connect the band before changing readings.");
+    }
+    const bytes = this.session.setRawEMGEnabled(enabled, now());
+    if (bytes.length) this.channel.write(bytes);
+    this.log.notice(`Requested raw EMG ${enabled ? "on" : "off"}`);
+  }
+
   private async scan(seconds: number): Promise<void> {
     this.deadline = now() + seconds + 20;
     const devices = await bluez.scan(seconds, (found) => {

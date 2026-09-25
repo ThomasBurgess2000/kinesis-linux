@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { AirShieldCipher, AirShieldKeys, AirShieldReceiver } from "../src/airshield";
 import { OwnershipCeremony } from "../src/ceremony";
+import { parseEMGBatch } from "../src/emg";
 import type { BandEvent } from "../src/gestures";
 import { SigningKey } from "../src/identity";
 import { BandSession } from "../src/session";
@@ -154,4 +155,31 @@ test("without a stored band key, the band proof is accepted unverified (advisory
   const session = new BandSession({ enrollment: { privateKey: appKey } });
   const band = new SyntheticBand(session, { signingKey: SigningKey.generate() });
   expect(has(band.setupEvents, "connected")).toBe(true);
+});
+
+test("raw sEMG turns on alongside gestures, its batches come through, and stop turns it off too", () => {
+  const session = new BandSession();
+  const band = new SyntheticBand(session);
+  const events = band.deliver(session.setRawEMGEnabled(true, 100));
+  const config = events.find((e) => e.payload.type === "rawEMGConfiguration");
+  expect(config?.payload).toMatchObject({ config: { sampleRate: 2048, channels: 8, adcBits: 16, samplesPerBatch: 16, encoding: 0 } });
+  expect(events.find((e) => e.payload.type === "rawEMGState")?.payload).toEqual({ type: "rawEMGState", enabled: true });
+  expect(session.streamsEnabled).toBe(true);
+
+  const frame = band.emg(7, 5_000_000).find((e) => e.payload.type === "rawEMGFrame");
+  const batch = parseEMGBatch((frame!.payload as { payload: Uint8Array }).payload);
+  expect(batch.sequence).toBe(7n);
+  expect(batch.values[0]).toBe(1000);
+  expect(batch.values[15 * 8 + 7]).toBe(1157);
+  expect(session.rawEMGFrames).toBe(1);
+
+  const stop = new ProtoFields(new ProtoFields(band.read(session.stop())[0]!.payload).bytes(4));
+  expect([2, 3, 6, 8].map((f) => stop.integer(f))).toEqual([0n, 0n, 0n, 0n]);
+});
+
+test("readings requested before a reconnect come back on with the subscription", () => {
+  const session = new BandSession({ rawEMG: true });
+  const band = new SyntheticBand(session);
+  expect(has(band.setupEvents, "connected")).toBe(true);
+  expect(band.setupEvents.find((e) => e.payload.type === "rawEMGState")?.payload).toEqual({ type: "rawEMGState", enabled: true });
 });

@@ -10,6 +10,7 @@ import { Daemon, DaemonError, daemonRunning } from "../src/daemon";
 import type { PairProgress } from "../src/enroll";
 import type { BandEvent, BandGesture, BandHand } from "../src/gestures";
 import { BandIdentity, SigningKey } from "../src/identity";
+import { BandWire, concat } from "../src/wire";
 
 const quiet: Logger = { info() {}, notice() {}, error() {} };
 const band = { address: "AA:BB:CC:DD:EE:FF", addressType: "public" as const, name: "Meta Band TEST" };
@@ -28,6 +29,10 @@ class FakeConnection implements ConnectionLike {
     this.end?.(undefined);
   }
   setHandedness(_: BandHand): void {}
+  rawEMG: boolean[] = [];
+  setRawEMG(enabled: boolean): void {
+    this.rawEMG.push(enabled);
+  }
 }
 
 function swipe(time: number, action = "left", sequence = 1): BandEvent {
@@ -258,4 +263,49 @@ test("the lifetime gesture count survives a restart", async () => {
   const again = await startDaemon({ withBand: true });
   expect((await again.client.call("getState")).result.totalGestures).toBe(2);
   again.client.close();
+});
+
+function emgPayload(sequence: number, timestampUs: number): Uint8Array {
+  const samples = new Uint8Array(256);
+  const view = new DataView(samples.buffer);
+  for (let i = 0; i < 128; i++) view.setUint16(i * 2, 32000 + i, true);
+  return concat(BandWire.field(1, sequence), BandWire.field(2, timestampUs), BandWire.field(3, samples));
+}
+
+test("developer mode's live EMG reaches the viewer and records as JSONL", async () => {
+  const connection = new FakeConnection();
+  const { client } = await startDaemon({ withBand: true, connection });
+  connection.emit!({ payload: { type: "connected" }, receivedAt: clock.now });
+  connection.emit!({ payload: { type: "handedness", hand: "right" }, receivedAt: clock.now });
+  connection.emit!({ payload: { type: "heartbeat" }, receivedAt: clock.now });
+  expect((await client.call("startRecording", { path: join(dir, "x.jsonl") })).error).toContain("Turn on live EMG");
+
+  await client.call("setConfig", { patch: { developerMode: true, rawEMG: true } });
+  expect(connection.rawEMG).toEqual([true]);
+  const config = { sampleRate: 2048, channels: 8, adcBits: 16, samplesPerBatch: 16, encoding: 0 };
+  connection.emit!({ payload: { type: "rawEMGConfiguration", config }, receivedAt: clock.now });
+  connection.emit!({ payload: { type: "rawEMGState", enabled: true }, receivedAt: clock.now });
+  const on = await client.until((e) => e.event === "state" && e.data.readings.active === true);
+  expect(on.data.readings).toMatchObject({ wanted: true, pending: false, config: { sampleRate: 2048 } });
+
+  const path = join(dir, "capture.jsonl");
+  expect((await client.call("startRecording", { path })).result.readings.recording.path).toBe(path);
+  connection.emit!({ payload: { type: "rawEMGFrame", payload: emgPayload(1, 1_000_000) }, receivedAt: clock.now });
+  connection.emit!({ payload: { type: "rawEMGFrame", payload: emgPayload(3, 1_015_625) }, receivedAt: clock.now });
+  const emg = await client.until((e) => e.event === "emg" && e.data.batches.length > 0);
+  expect(emg.data.batches[0].values.length).toBe(128);
+  expect(emg.data.batches[0].values[5]).toBe(32005);
+  const stats = await client.until((e) => e.event === "state" && e.data.readings.frames === 2);
+  expect(stats.data.readings.missingBatches).toBe(1);
+
+  await client.call("stopRecording");
+  const lines = (await Bun.file(path).text()).trim().split("\n").map((l) => JSON.parse(l));
+  expect(lines.length).toBe(2);
+  expect(lines[0]).toMatchObject({ channel: 5, kind: "0x0200020a", bytes: emgPayload(1, 1_000_000).length });
+  expect(lines[0].payload).toBe(Buffer.from(emgPayload(1, 1_000_000)).toString("hex"));
+
+  // Leaving developer mode turns readings off.
+  await client.call("setConfig", { patch: { developerMode: false } });
+  expect(connection.rawEMG).toEqual([true, false]);
+  client.close();
 });

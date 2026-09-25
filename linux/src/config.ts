@@ -27,6 +27,10 @@ export interface Config {
   setupDone: boolean;
   /// The daemon connects and enables controls as soon as it starts.
   startAutomatically: boolean;
+  /// Developer mode unlocks the readings page (live raw sEMG and recording).
+  developerMode: boolean;
+  /// Live raw sEMG was on (restored when developer mode is on).
+  rawEMG: boolean;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -43,6 +47,8 @@ export const DEFAULT_CONFIG: Config = {
   psm: 255,
   setupDone: false,
   startAutomatically: true,
+  developerMode: false,
+  rawEMG: false,
 };
 
 export function configPath(): string {
@@ -94,6 +100,8 @@ export function normalize(raw: unknown): Config {
   if (typeof raw.psm === "number" && Number.isInteger(raw.psm) && raw.psm > 0 && raw.psm <= 0xffff) config.psm = raw.psm;
   if (typeof raw.setupDone === "boolean") config.setupDone = raw.setupDone;
   if (typeof raw.startAutomatically === "boolean") config.startAutomatically = raw.startAutomatically;
+  if (typeof raw.developerMode === "boolean") config.developerMode = raw.developerMode;
+  if (typeof raw.rawEMG === "boolean") config.rawEMG = raw.rawEMG;
   return config;
 }
 
@@ -175,6 +183,8 @@ export function applyConfigPatch(config: Config, patch: unknown): Config {
       case "directL2cap":
       case "setupDone":
       case "startAutomatically":
+      case "developerMode":
+      case "rawEMG":
         if (typeof value !== "boolean") throw new ConfigError(`${key} must be true or false`);
         next[key] = value;
         break;
@@ -196,7 +206,7 @@ export function settingPatch(key: string, value: string): Record<string, unknown
     parsed = Number(value);
   } else if (group === "configChannel") {
     parsed = value.startsWith("0x") ? parseInt(value, 16) : Number(value);
-  } else if (["bond", "directL2cap", "setupDone", "startAutomatically"].includes(group)) {
+  } else if (["bond", "directL2cap", "setupDone", "startAutomatically", "developerMode", "rawEMG"].includes(group)) {
     parsed = value === "true" ? true : value === "false" ? false : value;
   }
   return name === undefined ? { [group]: parsed } : { [group]: { [name]: parsed } };

@@ -4,6 +4,7 @@
 import type { ActionBackend } from "./actions";
 import type { Config } from "./config";
 import { type BandOperation, type Logger, now } from "./connection";
+import type { EMGConfiguration } from "./emg";
 import type { BandEnrollmentIdentity } from "./identity";
 import {
   ACTION_TITLES, type Action, ActionGate, type BandDevice, type BandEvent, type BandHand, DialRouter, GestureRouter,
@@ -15,6 +16,17 @@ export interface ConnectionLike {
   start(operation: BandOperation, onEvent: (event: BandEvent) => void, onEnd: (error: Error | undefined) => void): Promise<void>;
   stop(): void;
   setHandedness(hand: BandHand): void;
+  setRawEMG(enabled: boolean): void;
+}
+
+/// Raw sEMG readings (developer mode): what's wanted, what the band confirmed, and its layout.
+export interface ReadingsState {
+  wanted: boolean;
+  active: boolean;
+  /// A change is on its way to the band (or will be applied when it connects).
+  pending: boolean;
+  error: string | undefined;
+  config: EMGConfiguration | undefined;
 }
 
 /// Machine-readable connection status; `phase` is the matching human text.
@@ -83,6 +95,7 @@ export interface ControllerState {
   linkCongested: boolean;
   /// The desktop is showing a Bluetooth pairing request to accept.
   awaitingSystemPairing: boolean;
+  readings: ReadingsState;
 }
 
 export interface ControllerHooks {
@@ -90,6 +103,8 @@ export interface ControllerHooks {
   onGesture?(gesture: RecognizedGesture): void;
   onDial?(delta: number): void;
   onAction?(result: ActionResult): void;
+  /// One raw sEMG batch, as the band sent it.
+  onRawEMG?(payload: Uint8Array, receivedAt: number): void;
   onHandConfirmed?(hand: BandHand): void;
   /// BlueZ resolved the band's current identity (address may differ from the one saved at scan time).
   onBandResolved?(device: BandDevice): void;
@@ -102,6 +117,7 @@ export class Controller {
     handConfirmed: false, pendingHand: undefined, handSettingError: undefined, lastGesture: "Waiting for a gesture",
     lastAction: "Controls are paused", gestureCount: 0, dialEngaged: false, pinchedFinger: undefined, error: undefined,
     streamHint: undefined, linkCongested: false, awaitingSystemPairing: false,
+    readings: { wanted: false, active: false, pending: false, error: undefined, config: undefined },
   };
   private wantsConnection = false;
   private busy = false;
@@ -147,7 +163,10 @@ export class Controller {
   private connectOperation(band: BandDevice): BandOperation {
     return {
       kind: "connect", band, security: this.config.security,
-      session: { configChannel: this.config.configChannel, ...(this.enrollment ? { enrollment: this.enrollment } : {}) },
+      session: {
+        configChannel: this.config.configChannel, rawEMG: this.state.readings.wanted,
+        ...(this.enrollment ? { enrollment: this.enrollment } : {}),
+      },
       bond: this.config.bond, directL2cap: this.config.directL2cap, psm: this.config.psm,
     };
   }
@@ -171,6 +190,27 @@ export class Controller {
   updateConfig(config: Config, backend?: ActionBackend): void {
     this.config = config;
     if (backend) this.backend = backend;
+    this.changed();
+  }
+
+  /// Ask for raw sEMG on or off. Applied now if the band is live, otherwise on the next connect.
+  setRawEMG(enabled: boolean): void {
+    const readings = this.state.readings;
+    readings.wanted = enabled;
+    readings.error = undefined;
+    if (this.state.live) {
+      readings.pending = readings.active !== enabled;
+      if (readings.pending) {
+        try {
+          this.connection.setRawEMG(enabled);
+        } catch (error) {
+          readings.pending = false;
+          readings.error = error instanceof Error ? error.message : String(error);
+        }
+      }
+    } else {
+      readings.pending = false;
+    }
     this.changed();
   }
 
@@ -305,6 +345,8 @@ export class Controller {
     this.state.streamHint = undefined;
     this.state.linkCongested = false;
     this.state.awaitingSystemPairing = false;
+    // A new session starts with EMG off; the session turns it back on after subscribing if wanted.
+    this.state.readings = { ...this.state.readings, active: false, pending: this.state.readings.wanted, config: undefined };
     this.connection.start(operation, (event) => this.receive(event), (error) => this.connectionEnded(error))
       .catch((error: unknown) => this.connectionEnded(error instanceof Error ? error : new Error(String(error))));
   }
@@ -370,6 +412,26 @@ export class Controller {
       case "systemPairingPending":
         this.state.awaitingSystemPairing = true;
         this.changed();
+        break;
+      case "rawEMGConfiguration":
+        this.state.readings.config = payload.config;
+        this.changed();
+        break;
+      case "rawEMGState":
+        this.state.readings.active = payload.enabled;
+        this.state.readings.pending = this.state.readings.wanted !== payload.enabled;
+        this.changed();
+        // The wish changed while this change was in flight: send the newer one.
+        if (this.state.readings.pending && this.state.live) this.setRawEMG(this.state.readings.wanted);
+        break;
+      case "rawEMGFailure":
+        this.state.readings.pending = false;
+        this.state.readings.error = payload.message;
+        this.changed();
+        break;
+      case "rawEMGFrame":
+        this.markDataArrived(event.receivedAt);
+        this.hooks.onRawEMG?.(payload.payload, event.receivedAt);
         break;
       case "connected":
         this.state.awaitingSystemPairing = false;

@@ -43,6 +43,7 @@ export class SyntheticBand {
   private ourSeed!: Uint8Array;
   private ourPoint!: Uint8Array;
   private streamSeq = 0;
+  private rawOn = false;
   /// Events emitted while the constructor drove setup to a live stream.
   readonly setupEvents: BandEvent[] = [];
 
@@ -141,6 +142,13 @@ export class SyntheticBand {
     }
     // Our reply to the band proof (0x03001000 on channel 2): nothing to send.
     if (kind === 0x03001000) return [];
+    // EMG config read (channel 0x8007): the observed 2048 Hz, 8 × 16-bit, 16 per batch layout.
+    if (frame.channel === 0x8007) {
+      const id = new ProtoFields(frame.payload).integer(1);
+      const emg = concat(BandWire.field(1, 2048), BandWire.field(2, 8), BandWire.field(4, 16), BandWire.field(5, 16), BandWire.field(10, 0));
+      return [this.encrypt(BandWire.frame(7, [0x02000315], concat(BandWire.field(1, id), BandWire.field(2, 1),
+        BandWire.field(6, BandWire.field(42, emg)))))];
+    }
     // BatteryInfoReq (channel 0x8008): 76%, charging, as BatteryInfoResp → batteryData.
     if (frame.channel === 0x8008) {
       const id = new ProtoFields(frame.payload).integer(1);
@@ -161,8 +169,10 @@ export class SyntheticBand {
         const config = concat(BandWire.field(10, 0), BandWire.field(2, 2048));
         return [this.encrypt(BandWire.frame(6, [0x02000315], concat(BandWire.field(1, id), BandWire.field(2, 1), BandWire.field(6, config))))];
       }
-      // Stream control: acknowledge with all requested flags enabled.
-      const flags = concat(BandWire.field(3, 1), BandWire.field(6, 1), BandWire.field(8, 1));
+      // Stream control: gestures and motion on; raw sEMG (flag 2) as last requested.
+      const control = new ProtoFields(fields.bytes(4));
+      if (control.contains(2)) this.rawOn = control.integer(2) === 1n;
+      const flags = concat(BandWire.field(2, this.rawOn ? 1 : 0), BandWire.field(3, 1), BandWire.field(6, 1), BandWire.field(8, 1));
       return [this.encrypt(BandWire.frame(5, [0x02000315], concat(BandWire.field(1, id), BandWire.field(2, 1), BandWire.field(5, flags))))];
     }
     return [];
@@ -178,6 +188,15 @@ export class SyntheticBand {
       BandWire.field(3, options.finger ?? 2), BandWire.field(4, action), BandWire.field(5, options.derived ?? 0));
     const frame = BandWire.frame(0x8005, [0x0200020d], payload);
     return this.session.feed(this.encrypt(frame), 100 + now).events;
+  }
+
+  /// Send one raw sEMG batch: sample s, channel c reads 1000 + 10·s + c.
+  emg(sequence: number, timestampUs: number): BandEvent[] {
+    const samples = new Uint8Array(256);
+    const view = new DataView(samples.buffer);
+    for (let s = 0; s < 16; s++) for (let c = 0; c < 8; c++) view.setUint16((s * 8 + c) * 2, 1000 + 10 * s + c, true);
+    const payload = concat(BandWire.field(1, sequence), BandWire.field(2, timestampUs), BandWire.field(3, samples));
+    return this.session.feed(this.encrypt(BandWire.frame(5, [0x0200020a], payload)), 150).events;
   }
 
   /// Read what the session sent (e.g. the stop request) as decoded frames.

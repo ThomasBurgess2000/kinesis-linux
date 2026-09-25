@@ -26,6 +26,14 @@ Kirigami.ApplicationWindow {
     readonly property var ctl: st.controller || ({})
     readonly property bool paired: !!st.band && st.enrolled === true
 
+    // Leaving developer mode hides Readings; don't stay on a hidden tab.
+    Connections {
+        target: daemon
+        function onConfigChanged() {
+            if (daemon.config.developerMode !== true && root.currentPage === 3) root.currentPage = 2;
+        }
+    }
+
     /// The display title for an action id, from the daemon's catalog.
     function actionTitle(id) {
         const actions = daemon.catalog.actions || [];
@@ -147,6 +155,12 @@ Kirigami.ApplicationWindow {
                         QQC2.TabButton { text: "Overview"; width: implicitWidth; onClicked: root.currentPage = 0 }
                         QQC2.TabButton { text: "Gestures"; width: implicitWidth; onClicked: root.currentPage = 1 }
                         QQC2.TabButton { text: "Band"; width: implicitWidth; onClicked: root.currentPage = 2 }
+                        QQC2.TabButton {
+                            text: "Readings"
+                            visible: daemon.config.developerMode === true
+                            width: visible ? implicitWidth : 0
+                            onClicked: root.currentPage = 3
+                        }
                     }
                     Item { Layout.fillWidth: true }
                     QQC2.ToolButton {
@@ -175,6 +189,7 @@ Kirigami.ApplicationWindow {
                     OverviewPage {}
                     GesturesPage {}
                     BandPage {}
+                    ReadingsPage {}
                 }
 
                 PairingView {

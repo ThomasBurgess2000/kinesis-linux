@@ -80,6 +80,16 @@ QQC2.ScrollView {
             }
         }
 
+        FormCard.FormHeader { title: "Developer" }
+        FormCard.FormCard {
+            FormCard.FormSwitchDelegate {
+                text: "Developer mode"
+                description: "Unlocks readings: live muscle signals (raw EMG) and raw recording."
+                checked: daemon.config.developerMode === true
+                onToggled: daemon.setConfig({ developerMode: checked })
+            }
+        }
+
         FormCard.FormHeader { title: "Meta account" }
         FormCard.FormCard {
             FormCard.FormTextDelegate {

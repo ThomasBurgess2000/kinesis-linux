@@ -26,6 +26,10 @@ class FakeConnection implements ConnectionLike {
   setHandedness(hand: BandHand): void {
     this.hands.push(hand);
   }
+  rawEMG: boolean[] = [];
+  setRawEMG(enabled: boolean): void {
+    this.rawEMG.push(enabled);
+  }
 }
 
 const band = { address: "AA:BB:CC:DD:EE:FF", addressType: "random" as const, name: "Meta Band TEST" };

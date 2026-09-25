@@ -49,6 +49,7 @@ class Daemon(QObject):
     action = Signal("QVariantMap")
     dial = Signal(float)
     pairing = Signal("QVariantMap")
+    emg = Signal("QVariantMap")
     requestFailed = Signal(str)
     showWindowRequested = Signal()
 
@@ -155,6 +156,8 @@ class Daemon(QObject):
             self.action.emit(data)
         elif name == "dial":
             self.dial.emit(float(data.get("delta", 0)))
+        elif name == "emg":
+            self.emg.emit(data)
         elif name == "pairing":
             self._state = {**self._state, "pairing": data}
             self.pairing.emit(data)
@@ -291,6 +294,15 @@ class Daemon(QObject):
             systemctl("disable", "kinesis.service")
         self.startAtLoginChanged.emit()
 
+    @Slot(str)
+    def startRecording(self, url: str) -> None:
+        path = QUrl(url).toLocalFile() if url.startswith("file:") else url
+        self.call("startRecording", {"path": path}, self._take_state)
+
+    @Slot()
+    def stopRecording(self) -> None:
+        self.call("stopRecording", {}, self._take_state)
+
     @Slot()
     def openBluetoothSettings(self) -> None:
         subprocess.Popen(["systemsettings", "kcm_bluetooth"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -400,11 +412,16 @@ def check_fixture() -> dict:
             "enrolled": True, "metaUser": "42", "backend": "kde",
             "pairing": {"active": False, "step": None, "message": "", "url": None, "error": None, "failedStep": None,
                         "wrongAccount": False},
-            "setupDone": True, "startAutomatically": True, "totalGestures": 1234,
+            "setupDone": True, "startAutomatically": True, "totalGestures": 1234, "developerMode": True,
+            "readings": {"wanted": True, "active": True, "pending": False, "error": None,
+                         "config": {"sampleRate": 2048, "channels": 8, "adcBits": 16, "samplesPerBatch": 16, "encoding": 0},
+                         "issue": None, "frames": 4, "missingBatches": 0, "invalidFrames": 0, "sampleRate": 2048,
+                         "byteRate": 35840, "recording": None},
         },
         "config": {"swipes": {"left": "previousDesktop", "right": "nextDesktop", "up": "overview", "down": "dismiss"},
                    "taps": {"indexTap": "none", "indexDoubleTap": "playPause", "middleTap": "none", "middleDoubleTap": "mute", "middleHold": "none"},
-                   "dial": {"target": "volume", "sensitivity": 1}, "setupDone": True, "startAutomatically": True},
+                   "dial": {"target": "volume", "sensitivity": 1}, "setupDone": True, "startAutomatically": True,
+                   "developerMode": True, "rawEMG": True},
         "catalog": {"actions": [{"id": a, "title": t, "supported": True} for a, t in actions.items()],
                     "swipes": [{"id": d, "title": f"Swipe {d}"} for d in ["left", "right", "up", "down"]],
                     "taps": [{"id": t, "title": title} for t, title in taps.items()],
@@ -437,7 +454,13 @@ def run_check(engine: QQmlApplicationEngine, app: QApplication, daemon: Daemon, 
             Path(shots).mkdir(parents=True, exist_ok=True)
             window.grabWindow().save(str(Path(shots) / f"{name}.png"))
 
-    for page, name in enumerate(["overview", "gestures", "band"]):
+    # A few EMG batches (a slow wave per channel) so the readings trace draws something.
+    import math
+    batches = [{"sequence": str(i), "timestampUs": 1_000_000 + int(i * 7812.5),
+                "values": [int(32768 + 400 * math.sin((i * 16 + s) / 40 + c)) for s in range(16) for c in range(8)]}
+               for i in range(128)]
+    daemon.emg.emit({"restart": True, "batches": batches})
+    for page, name in enumerate(["overview", "gestures", "band", "readings"]):
         window.setProperty("currentPage", page)
         settle_and_shoot(f"page-{page}-{name}")
     window.setProperty("showingSetup", True)
