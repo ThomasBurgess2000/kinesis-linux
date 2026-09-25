@@ -240,3 +240,22 @@ test("suspend drops the band without reconnecting; resume reconnects", async () 
   expect(connection.active).toBe(true);
   client.close();
 });
+
+test("the lifetime gesture count survives a restart", async () => {
+  const connection = new FakeConnection();
+  const { client } = await startDaemon({ withBand: true, connection });
+  connection.emit!({ payload: { type: "connected" }, receivedAt: clock.now });
+  connection.emit!({ payload: { type: "handedness", hand: "right" }, receivedAt: clock.now });
+  connection.emit!({ payload: { type: "heartbeat" }, receivedAt: clock.now });
+  clock.now = 100.5;
+  connection.emit!(swipe(100.5, "left", 1));
+  clock.now = 101.5;
+  connection.emit!(swipe(101.5, "right", 2));
+  expect((await client.call("getState")).result.totalGestures).toBe(2);
+  client.close();
+  await daemon!.stop();
+  daemon = undefined;
+  const again = await startDaemon({ withBand: true });
+  expect((await again.client.call("getState")).result.totalGestures).toBe(2);
+  again.client.close();
+});

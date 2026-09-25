@@ -66,6 +66,13 @@ Kirigami.ApplicationWindow {
         root.hide();
     }
 
+    // The Mac app's ⌘⇧P: do the band's next step (pair, connect, enable or pause controls).
+    Shortcut {
+        sequence: "Ctrl+Shift+P"
+        enabled: daemon.nextStep.enabled
+        onActivated: daemon.nextStep.id === "pair" ? root.startPairing(false) : daemon.doNextStep()
+    }
+
     Connections {
         target: daemon
         function onRequestFailed(message) {

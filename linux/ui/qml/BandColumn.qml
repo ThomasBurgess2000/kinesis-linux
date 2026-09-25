@@ -112,9 +112,13 @@ ColumnLayout {
         QQC2.Label {
             Layout.alignment: Qt.AlignRight
             text: column.ctl.battery === undefined || column.ctl.battery === null ? "—"
-                : column.ctl.battery + "%" + (column.ctl.charging ? " · charging" : "")
+                : column.ctl.charging ? column.ctl.battery + "% · charging"
+                : column.ctl.battery >= 100 ? "Full" : column.ctl.battery + "%"
         }
         QQC2.Label { text: "Gestures"; opacity: 0.7 }
-        QQC2.Label { Layout.alignment: Qt.AlignRight; text: String(column.ctl.gestureCount || 0) }
+        QQC2.Label {
+            Layout.alignment: Qt.AlignRight
+            text: Number(column.st.totalGestures || 0).toLocaleString(Qt.locale(), "f", 0)
+        }
     }
 }

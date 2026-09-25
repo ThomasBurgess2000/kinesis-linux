@@ -318,6 +318,13 @@ def next_step(link: bool, state: dict) -> dict:
     return {"id": "enable", "title": "Enable controls", "enabled": True}
 
 
+def battery_text(level: int, charging) -> str:
+    """The Mac app's charge states: charging, full at 100%, else the level."""
+    if charging:
+        return f"Battery {level}% · charging"
+    return "Battery full" if level >= 100 else f"Battery {level}%"
+
+
 def autostart_entry() -> str:
     """The same login entry packaging/install.sh writes, from the shared template."""
     return (REPO / "packaging" / "kinesis-autostart.desktop").read_text().replace("@REPO@", str(REPO))
@@ -362,7 +369,7 @@ class Tray:
         battery = controller.get("battery")
         self.battery.setVisible(battery is not None)
         if battery is not None:
-            self.battery.setText(f"Battery {battery}%" + (" · charging" if controller.get("charging") else ""))
+            self.battery.setText(battery_text(battery, controller.get("charging")))
         step = self.daemon.nextStep
         self.step.setText(step["title"])
         self.step.setEnabled(step["enabled"])
@@ -393,7 +400,7 @@ def check_fixture() -> dict:
             "enrolled": True, "metaUser": "42", "backend": "kde",
             "pairing": {"active": False, "step": None, "message": "", "url": None, "error": None, "failedStep": None,
                         "wrongAccount": False},
-            "setupDone": True, "startAutomatically": True,
+            "setupDone": True, "startAutomatically": True, "totalGestures": 1234,
         },
         "config": {"swipes": {"left": "previousDesktop", "right": "nextDesktop", "up": "overview", "down": "dismiss"},
                    "taps": {"indexTap": "none", "indexDoubleTap": "playPause", "middleTap": "none", "middleDoubleTap": "mute", "middleHold": "none"},

@@ -7,6 +7,7 @@
 
 import type { Socket } from "bun";
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ALL_ACTIONS, type ActionBackend, backendFor } from "./actions";
 import * as bluez from "./bluez";
@@ -23,6 +24,11 @@ import { BandIdentity } from "./identity";
 import { MetaSessionStore } from "./meta-auth";
 import { MetaSessionInvalidError } from "./meta-pair";
 import { watchSleep } from "./sleep";
+
+/// Counters that outlive a session (the Mac app keeps them in UserDefaults).
+export function statsPath(): string {
+  return join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "kinesis", "stats.json");
+}
 
 export function socketPath(): string {
   const runtime = process.env.XDG_RUNTIME_DIR || join("/tmp", `kinesis-${process.getuid?.() ?? "user"}`);
@@ -60,6 +66,8 @@ export interface DaemonState {
   pairing: PairingState;
   setupDone: boolean;
   startAutomatically: boolean;
+  /// Every gesture recognized since the app was set up, across sessions.
+  totalGestures: number;
 }
 
 /// The pairing steps, swappable in tests.
@@ -81,6 +89,7 @@ export interface DaemonOptions {
   /// Connect on start when a band is saved and `startAutomatically` is on (default true).
   autoConnect?: boolean;
   clock?: () => number;
+  statsPath?: string;
   /// Suspend/resume notifications (default: systemd-logind). Returns a stop function.
   watchSleep?: (onChange: (sleeping: boolean) => void, log: Logger) => () => void;
 }
@@ -108,6 +117,8 @@ export class Daemon {
   private pairingAbort: AbortController | undefined;
   private stateTimer: ReturnType<typeof setTimeout> | undefined;
   private stopWatchingSleep: (() => void) | undefined;
+  private totalGestures = 0;
+  private statsTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly options: DaemonOptions = {}) {
     this.path = options.socketPath ?? socketPath();
@@ -136,6 +147,7 @@ export class Daemon {
       onBandResolved: (device) => void this.bandResolved(device),
     }, this.options.clock);
     await this.refreshAccount();
+    await this.loadStats();
 
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     chmodSync(dirname(this.path), 0o700);
@@ -162,6 +174,10 @@ export class Daemon {
 
   async stop(): Promise<void> {
     this.stopWatchingSleep?.();
+    if (this.statsTimer) {
+      clearTimeout(this.statsTimer);
+      await this.saveStats();
+    }
     this.pairingAbort?.abort();
     await this.controller?.disconnect();
     for (const client of this.clients) client.end();
@@ -182,6 +198,7 @@ export class Daemon {
       pairing: { ...this.pairing },
       setupDone: this.config.setupDone,
       startAutomatically: this.config.startAutomatically,
+      totalGestures: this.totalGestures,
     };
   }
 
@@ -255,7 +272,23 @@ export class Daemon {
     };
   }
 
+  private async loadStats(): Promise<void> {
+    const file = Bun.file(this.options.statsPath ?? statsPath());
+    const stats = (await file.exists()) ? await file.json().catch(() => ({})) : {};
+    this.totalGestures = typeof stats.totalGestures === "number" && stats.totalGestures >= 0 ? stats.totalGestures : 0;
+  }
+
+  private async saveStats(): Promise<void> {
+    this.statsTimer = undefined;
+    const path = this.options.statsPath ?? statsPath();
+    mkdirSync(dirname(path), { recursive: true });
+    await Bun.write(path, JSON.stringify({ totalGestures: this.totalGestures }) + "\n");
+  }
+
   private gestured(gesture: RecognizedGesture): void {
+    this.totalGestures += 1;
+    // Batch the writes: a burst of gestures is one save a few seconds later.
+    this.statsTimer ??= setTimeout(() => void this.saveStats(), 5000);
     const action: Action = gesture.kind === "swipe" ? this.config.swipes[gesture.direction] : this.config.taps[gesture.tap];
     this.broadcast("gesture", {
       kind: gesture.kind, key: recognizedKey(gesture), label: recognizedLabel(gesture), action, actionTitle: ACTION_TITLES[action],
