@@ -173,17 +173,37 @@ The service connects through BlueZ. The first connection after pairing mode asks
 shows a Bluetooth pairing request, and the band only opens its input channel once it's accepted.
 `kinesis forget` drops the saved band and removes it from BlueZ.
 
-**Known issue: reconnecting to an already-paired band can be slow.** After a restart, a resume, or a
-dropped link, BlueZ's connect to the bonded band can time out again and again for several minutes
-before one gets through. The dependable way back in is to remove the bond and pair fresh:
+### Unsolved: reconnecting to a paired band
+
+**This isn't solved yet, and I'd really appreciate help with it.** If you know BlueZ, LE bonding, or
+this band, please [open an issue](https://github.com/ThomasBurgess2000/kinesis-linux/issues) or a pull
+request.
+
+After a restart, a resume, or a dropped link, reconnecting to the already-paired (bonded) band is
+unreliable. BlueZ sees the band advertising, but its connect times out after 18 s, again and again.
+Once it took 15 attempts and about 7 minutes before one got through; other times the bond was
+removed before any attempt succeeded.
+
+What's known so far:
+
+- **Bonded, through BlueZ's connect** (the default): repeated `Connection timed out`, often for
+  minutes.
+- **Unbonded, through BlueZ's connect**: connects within about a minute of a button press, but the
+  band asks to pair while its settings are read, and accepting the request bonds it again, so the
+  next reconnect has the same problem.
+- **Unbonded, direct L2CAP** (`kinesis config set directL2cap true`, PSM 255): the band refuses the
+  channel (`Connection refused`) or times out on every attempt, even right after a button press.
+- The session protocol itself isn't involved: every failure happens before the first byte of it.
+
+Until it's fixed, the dependable way back in is to remove the bond and pair fresh:
 
 ```sh
 bluetoothctl remove <band address>    # the address is in `kinesis doctor`
 ```
 
-Then press the band's button and accept the pairing request. The direct L2CAP connect
-(`kinesis config set directL2cap true`) skips BlueZ's connect, but current firmware refuses it from
-an unbonded host.
+Then press the band's button and accept the pairing request. The most useful next step would be a
+`sudo btmon` capture of a slow bonded reconnect, to see whether the band never answers or BlueZ
+connects with a stale address or keys.
 
 ## Kernel
 
