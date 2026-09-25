@@ -16,11 +16,6 @@ QQC2.ScrollView {
         .map((a) => ({ id: a.id, title: applicationWindow().actionTitle(a.id) }))
     property string firing: ""
 
-    function indexOf(id) {
-        for (let i = 0; i < actions.length; i++) if (actions[i].id === id) return i;
-        return 0;
-    }
-
     function assign(group, gesture, action) {
         const patch = {};
         patch[group] = {};
@@ -58,15 +53,13 @@ QQC2.ScrollView {
                 Layout.topMargin: Kirigami.Units.largeSpacing
                 Repeater {
                     model: daemon.catalog.swipes || []
-                    delegate: FormCard.FormComboBoxDelegate {
+                    delegate: ChoiceDelegate {
                         required property var modelData
                         text: modelData.title
                         highlighted: gesturesPage.firing === "swipe:" + modelData.id
-                        model: gesturesPage.actions
-                        textRole: "title"
-                        valueRole: "id"
-                        currentIndex: gesturesPage.indexOf((gesturesPage.config.swipes || {})[modelData.id])
-                        onActivated: gesturesPage.assign("swipes", modelData.id, currentValue)
+                        options: gesturesPage.actions
+                        selectedId: (gesturesPage.config.swipes || {})[modelData.id] || "none"
+                        onChosen: (id) => gesturesPage.assign("swipes", modelData.id, id)
                     }
                 }
             }
@@ -75,15 +68,13 @@ QQC2.ScrollView {
                 Layout.topMargin: Kirigami.Units.largeSpacing
                 Repeater {
                     model: daemon.catalog.taps || []
-                    delegate: FormCard.FormComboBoxDelegate {
+                    delegate: ChoiceDelegate {
                         required property var modelData
                         text: modelData.title
                         highlighted: gesturesPage.firing === "tap:" + modelData.id
-                        model: gesturesPage.actions
-                        textRole: "title"
-                        valueRole: "id"
-                        currentIndex: gesturesPage.indexOf((gesturesPage.config.taps || {})[modelData.id])
-                        onActivated: gesturesPage.assign("taps", modelData.id, currentValue)
+                        options: gesturesPage.actions
+                        selectedId: (gesturesPage.config.taps || {})[modelData.id] || "none"
+                        onChosen: (id) => gesturesPage.assign("taps", modelData.id, id)
                     }
                 }
             }
@@ -92,18 +83,12 @@ QQC2.ScrollView {
                 spacing: 0
                 FormCard.FormCard {
                     Layout.topMargin: Kirigami.Units.largeSpacing
-                    FormCard.FormComboBoxDelegate {
+                    ChoiceDelegate {
                         text: "Pinch + turn"
                         description: "Pinch your index finger and thumb, then turn your wrist like a knob."
-                        model: daemon.catalog.dialTargets || []
-                        textRole: "title"
-                        valueRole: "id"
-                        currentIndex: {
-                            const targets = daemon.catalog.dialTargets || [];
-                            for (let i = 0; i < targets.length; i++) if (targets[i].id === (gesturesPage.config.dial || {}).target) return i;
-                            return 0;
-                        }
-                        onActivated: daemon.setConfig({ dial: { target: currentValue } })
+                        options: daemon.catalog.dialTargets || []
+                        selectedId: (gesturesPage.config.dial || {}).target || "none"
+                        onChosen: (id) => daemon.setConfig({ dial: { target: id } })
                     }
                     FormCard.FormDelegateSeparator {}
                     FormCard.AbstractFormDelegate {

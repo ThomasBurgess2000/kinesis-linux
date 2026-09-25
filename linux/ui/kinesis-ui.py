@@ -405,13 +405,18 @@ def check_fixture() -> dict:
 def run_check(engine: QQmlApplicationEngine, app: QApplication, daemon: Daemon, warnings: list, shots: str | None) -> int:
     """Load the window offscreen, visit every page and wizard step, and fail on any QML warning.
     With --screenshots DIR, also save a PNG of each view for a visual review."""
-    daemon.load_fixture(check_fixture())
+    fixture = check_fixture()
+    catalog = fixture.pop("catalog")
+    daemon.load_fixture({**fixture, "catalog": {"actions": [], "swipes": [], "taps": [], "dialTargets": []}})
     engine.load(QUrl.fromLocalFile(str(HERE / "qml" / "Main.qml")))
     if not engine.rootObjects():
         print("Main.qml failed to load", file=sys.stderr)
         return 1
     window = engine.rootObjects()[0]
     window.show()
+    # As with the real daemon, the action catalog arrives after the window is built.
+    app.processEvents()
+    daemon._take_catalog(catalog)
 
     def settle_and_shoot(name: str) -> None:
         for _ in range(20):
