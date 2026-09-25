@@ -31,7 +31,7 @@ export interface Config {
 
 export const DEFAULT_CONFIG: Config = {
   swipes: { left: "previousDesktop", right: "nextDesktop", up: "overview", down: "dismiss" },
-  taps: { indexTap: "none", indexDoubleTap: "playPause", middleTap: "none", middleDoubleTap: "mute" },
+  taps: { indexTap: "none", indexDoubleTap: "playPause", middleTap: "none", middleDoubleTap: "mute", middleHold: "none" },
   dial: { target: "volume", sensitivity: 1 },
   backend: "auto",
   commands: {},

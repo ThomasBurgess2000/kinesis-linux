@@ -31,7 +31,7 @@ usage:
   kinesis doctor                                  check Bluetooth, tools, and permissions
   kinesis forget                                  drop the saved band and remove it from BlueZ
 
-config keys: swipes.left|right|up|down  taps.indexTap|indexDoubleTap|middleTap|middleDoubleTap
+config keys: swipes.left|right|up|down  taps.indexTap|indexDoubleTap|middleTap|middleDoubleTap|middleHold
              dial.target (none|volume|brightness)  dial.sensitivity (0.5–4)  backend (auto|kde|command)
              security (low|medium|high)  linkSetup (pipelined|phased)  configChannel (e.g. 0x8006)
              commands.<action> (JSON array of argv)

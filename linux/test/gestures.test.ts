@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ActionGate, type BandGesture, DialRouter, GestureRouter, type RecognizedGesture } from "../src/gestures";
+import { ActionGate, type BandGesture, DialRouter, GestureRouter, type RecognizedGesture, type TapGesture, recognizedLabel } from "../src/gestures";
 
 function gesture(sequence: number, options: { time?: number; action?: string; derived?: string; finger?: string; synthetic?: boolean } = {}): BandGesture {
   return {
@@ -9,7 +9,7 @@ function gesture(sequence: number, options: { time?: number; action?: string; de
   };
 }
 const swipe = (direction: "left" | "right" | "up" | "down"): RecognizedGesture => ({ kind: "swipe", direction });
-const tap = (t: "indexTap" | "indexDoubleTap" | "middleTap" | "middleDoubleTap"): RecognizedGesture => ({ kind: "tap", tap: t });
+const tap = (t: TapGesture): RecognizedGesture => ({ kind: "tap", tap: t });
 
 test("one swipe produces one action across raw, derived, and repeated messages", () => {
   const router = new GestureRouter();
@@ -74,6 +74,16 @@ test("double taps are recognized once and partial pinches are ignored", () => {
   expect(router.gesture(gesture(3, { time: 101, action: "unknown", derived: "doubleTap", finger: "middle" }), 101)).toEqual(tap("middleDoubleTap"));
   expect(router.gesture(gesture(4, { time: 102, action: "partialClick", finger: "index" }), 102)).toBeUndefined();
   expect(router.gesture(gesture(5, { time: 103, action: "doubletap", finger: "middle", synthetic: true }), 103)).toBeUndefined();
+});
+
+test("a middle hold is its own gesture; an index hold stays the pinch dial", () => {
+  const router = new GestureRouter();
+  expect(router.gesture(gesture(1, { action: "hold", finger: "middle" }), 100)).toEqual(tap("middleHold"));
+  // The derived copy of the same hold is de-duplicated.
+  expect(router.gesture(gesture(2, { time: 100.05, action: "unknown", derived: "buttonHold", finger: "middle" }), 100.05)).toBeUndefined();
+  expect(router.gesture(gesture(3, { time: 102, action: "unknown", derived: "buttonHold", finger: "middle" }), 102)).toEqual(tap("middleHold"));
+  expect(router.gesture(gesture(4, { time: 103, action: "unknown", derived: "buttonHold", finger: "index" }), 103)).toBeUndefined();
+  expect(recognizedLabel(tap("middleHold"))).toBe("Middle hold");
 });
 
 test("dial reversal and release do not carry over old movement", () => {

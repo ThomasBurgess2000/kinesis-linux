@@ -376,7 +376,8 @@ def check_fixture() -> dict:
     actions = {"none": "No action", "previousDesktop": "Previous desktop", "nextDesktop": "Next desktop", "overview": "Overview",
                "dismiss": "Dismiss (Escape)", "playPause": "Play / pause", "mute": "Mute / unmute", "volumeUp": "Volume up",
                "volumeDown": "Volume down"}
-    taps = {"indexTap": "Index tap", "indexDoubleTap": "Index double tap", "middleTap": "Middle tap", "middleDoubleTap": "Middle double tap"}
+    taps = {"indexTap": "Index tap", "indexDoubleTap": "Index double tap", "middleTap": "Middle tap", "middleDoubleTap": "Middle double tap",
+            "middleHold": "Middle hold"}
     return {
         "state": {
             "controller": {"phase": "Connected", "status": "connected", "live": True, "controlsEnabled": True, "battery": 92,
@@ -391,7 +392,7 @@ def check_fixture() -> dict:
             "setupDone": True, "startAutomatically": True,
         },
         "config": {"swipes": {"left": "previousDesktop", "right": "nextDesktop", "up": "overview", "down": "dismiss"},
-                   "taps": {"indexTap": "none", "indexDoubleTap": "playPause", "middleTap": "none", "middleDoubleTap": "mute"},
+                   "taps": {"indexTap": "none", "indexDoubleTap": "playPause", "middleTap": "none", "middleDoubleTap": "mute", "middleHold": "none"},
                    "dial": {"target": "volume", "sensitivity": 1}, "setupDone": True, "startAutomatically": True},
         "catalog": {"actions": [{"id": a, "title": t, "supported": True} for a, t in actions.items()],
                     "swipes": [{"id": d, "title": f"Swipe {d}"} for d in ["left", "right", "up", "down"]],

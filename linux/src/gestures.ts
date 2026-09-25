@@ -61,13 +61,15 @@ export function gestureLabel(gesture: BandGesture): string | undefined {
 export const SWIPE_DIRECTIONS = ["left", "right", "up", "down"] as const;
 export type SwipeDirection = (typeof SWIPE_DIRECTIONS)[number];
 
-export const TAP_GESTURES = ["indexTap", "indexDoubleTap", "middleTap", "middleDoubleTap"] as const;
+// An index hold is the pinch dial, so only the middle finger has a hold of its own.
+export const TAP_GESTURES = ["indexTap", "indexDoubleTap", "middleTap", "middleDoubleTap", "middleHold"] as const;
 export type TapGesture = (typeof TAP_GESTURES)[number];
 
 export function tapFinger(tap: TapGesture): "index" | "middle" {
   return tap === "indexTap" || tap === "indexDoubleTap" ? "index" : "middle";
 }
-export function tapAction(tap: TapGesture): "tap" | "doubletap" {
+export function tapAction(tap: TapGesture): "tap" | "doubletap" | "hold" {
+  if (tap === "middleHold") return "hold";
   return tap === "indexTap" || tap === "middleTap" ? "tap" : "doubletap";
 }
 
@@ -80,7 +82,8 @@ export function recognizedKey(gesture: RecognizedGesture): string {
 export function recognizedLabel(gesture: RecognizedGesture): string {
   if (gesture.kind === "swipe") return `Swipe ${gesture.direction}`;
   const finger = tapFinger(gesture.tap);
-  return `${finger.charAt(0).toUpperCase()}${finger.slice(1)} ${tapAction(gesture.tap) === "tap" ? "tap" : "double tap"}`;
+  const motion = { tap: "tap", doubletap: "double tap", hold: "hold" }[tapAction(gesture.tap)];
+  return `${finger.charAt(0).toUpperCase()}${finger.slice(1)} ${motion}`;
 }
 
 export class GestureRouter {
@@ -104,7 +107,7 @@ export class GestureRouter {
       gesture = { kind: "swipe", direction };
       source = derived[message.derivedAction] === undefined ? "raw" : "derived";
     } else {
-      const actions: Record<string, string> = { singleTap: "tap", doubleTap: "doubletap" };
+      const actions: Record<string, string> = { singleTap: "tap", doubleTap: "doubletap", buttonHold: "hold" };
       const action = actions[message.derivedAction] ?? message.action;
       const tap = TAP_GESTURES.find((t) => tapFinger(t) === message.finger && tapAction(t) === action);
       if (!tap) return undefined;
