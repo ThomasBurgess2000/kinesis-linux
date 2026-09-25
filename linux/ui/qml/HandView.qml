@@ -4,7 +4,8 @@
 // springs, so a new gesture bends the motion already under way.
 //
 // Drive it with `hand`, `highlight` ("none" | "index" | "middle"), `sustained` (a pinch is held),
-// `roll` (degrees, while dialing), and play(gesture) for each recognized gesture.
+// `roll` (degrees, while dialing), and play(gesture) for each recognized gesture. The cursor page
+// also turns the whole hand with the forearm: `aimLeft` and `aimUp`, in degrees from rest.
 
 import QtQuick
 import QtQuick3D
@@ -20,6 +21,11 @@ Item {
     property real roll: 0
     /// Upstream frames the overview hand with 0.72 of the view to spare, and setup's with 0.7.
     property real margin: 0.72
+    /// Degrees the forearm has turned from rest, left and up, for a hand that mirrors the arm.
+    property real aimLeft: 0
+    property real aimUp: 0
+    Behavior on aimLeft { NumberAnimation { duration: 80 } }
+    Behavior on aimUp { NumberAnimation { duration: 80 } }
 
     // --- poses (HandRig.swift): finger curls, thumb base (x, y, z), thumb middle, thumb end, roll ---
     readonly property var relaxed: pose([18, 24, 12], [22, 28, 14], [26, 32, 16], [30, 34, 18], [0, 0, 0], 8, 10)
@@ -254,10 +260,14 @@ Item {
             verticalMagnification: magnification
         }
 
-        // A left hand is drawn mirrored, with its fingers to the right.
+        // A left hand is drawn mirrored, with its fingers to the right. Seen from the thumb side,
+        // the fingers point where the arm points: raising it tilts them up in the picture, and
+        // turning it left swings them toward the wearer's left.
         Node {
             id: handRoot
             scale: Qt.vector3d(view.hand === "left" ? -1 : 1, 1, 1)
+            rotation: Quaternion.fromAxisAndAngle(Qt.vector3d(0, 1, 0), view.aimLeft)
+                .times(Quaternion.fromAxisAndAngle(Qt.vector3d(0, 0, 1), view.hand === "left" ? view.aimUp : -view.aimUp))
             // The dial is a knob held in a pinch: the hand turns around the pinch, along the forearm.
             Node {
                 id: rollNode
@@ -303,6 +313,15 @@ Item {
     Component {
         id: jointComponent
         Node {}
+    }
+
+    // Nothing may fire into a hand that's being torn down.
+    Component.onDestruction: {
+        keyTimer.stop();
+        holdTimer.stop();
+        glow.stop();
+        glowOut.stop();
+        moving = false;
     }
 
     // Rebuild the finger chains: the model stores its joints flat.

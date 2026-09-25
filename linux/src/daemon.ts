@@ -3,7 +3,7 @@
 //
 // Protocol: newline-delimited JSON. Requests are {id, method, params}; replies are {id, result} or
 // {id, error}. The daemon also pushes {event, data} messages: state (coalesced), config, gesture,
-// action, dial, and log.
+// action, dial, pairing, log, emg, and motion (while a client views readings or the cursor page).
 
 import type { Socket } from "bun";
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
@@ -13,7 +13,9 @@ import { ALL_ACTIONS, type ActionBackend, backendFor } from "./actions";
 import * as bluez from "./bluez";
 import { type Config, ConfigError, applyConfigPatch, configPath, loadConfig, saveConfig } from "./config";
 import { BandConnection, KinesisError, type Logger } from "./connection";
-import { type ActionResult, type ConnectionLike, Controller, type ControllerState, type ReadingsState } from "./controller";
+import {
+  type ActionResult, type ConnectionLike, Controller, type ControllerState, type CursorOptions, type ReadingsState,
+} from "./controller";
 import { type DoctorRow, doctorRows } from "./doctor";
 import { type PairStep, PairingCancelled, claimBand, findBand, isWrongAccount, obtainMetaSession } from "./enroll";
 import {
@@ -23,6 +25,7 @@ import {
 import { BandIdentity } from "./identity";
 import { MetaSessionStore } from "./meta-auth";
 import { MetaSessionInvalidError } from "./meta-pair";
+import { MotionLog, MotionReadings } from "./motion";
 import { EMGReadings, RawRecorder, type ReadingsStats } from "./readings";
 import { watchSleep } from "./sleep";
 
@@ -95,6 +98,15 @@ export interface DaemonOptions {
   statsPath?: string;
   /// Suspend/resume notifications (default: systemd-logind). Returns a stop function.
   watchSleep?: (onChange: (sleeping: boolean) => void, log: Logger) => () => void;
+  /// How the air cursor reaches the desktop (default: a uinput mouse and the keyboards' evdev nodes).
+  cursor?: CursorOptions;
+  motionLog?: MotionLog;
+}
+
+/// What a client is looking at that needs the motion stream.
+interface Viewing {
+  readings: boolean;
+  cursor: boolean;
 }
 
 type Params = Record<string, unknown>;
@@ -127,6 +139,10 @@ export class Daemon {
   private recorder: RawRecorder | undefined;
   private emgTimer: ReturnType<typeof setInterval> | undefined;
   private emgTicks = 0;
+  private readonly motion = new MotionReadings();
+  private motionLog!: MotionLog;
+  /// Per client (or "local" for in-process calls): which motion views are open.
+  private readonly viewing = new Map<unknown, Viewing>();
 
   constructor(private readonly options: DaemonOptions = {}) {
     this.path = options.socketPath ?? socketPath();
@@ -162,7 +178,11 @@ export class Daemon {
       onDial: (delta) => this.broadcast("dial", { delta }),
       onHandConfirmed: (hand) => void this.handConfirmed(hand),
       onBandResolved: (device) => void this.bandResolved(device),
-    }, this.options.clock);
+      onMotion: (sample) => this.motion.receive(sample),
+      onBandEvent: (event) => this.motionLog.record(event),
+    }, this.options.clock, this.options.cursor);
+    this.motionLog = this.options.motionLog ?? new MotionLog();
+    if (this.motionLog.isOn) this.updateViewers();
     await this.refreshAccount();
     await this.loadStats();
     // Live EMG is a developer-mode feature; its last setting comes back with it.
@@ -178,8 +198,8 @@ export class Daemon {
         open: (socket) => { socket.data = { buffer: "", queue: [] }; this.clients.add(socket); },
         data: (socket, chunk) => this.received(socket, chunk),
         drain: (socket) => this.flush(socket),
-        close: (socket) => { this.clients.delete(socket); },
-        error: (socket) => { this.clients.delete(socket); },
+        close: (socket) => this.dropClient(socket),
+        error: (socket) => this.dropClient(socket),
       },
     });
     chmodSync(this.path, 0o600);
@@ -195,6 +215,8 @@ export class Daemon {
   async stop(): Promise<void> {
     this.stopWatchingSleep?.();
     if (this.emgTimer) clearInterval(this.emgTimer);
+    this.controller?.closePointer();
+    await this.motionLog?.close();
     await this.stopRecording();
     if (this.statsTimer) {
       clearTimeout(this.statsTimer);
@@ -235,8 +257,13 @@ export class Daemon {
   }
 
   /// New EMG batches go to viewers about 20 times a second, and recordings are flushed twice a second.
+  /// Motion goes out at the same pace while a client views readings or the cursor page.
   private pushReadings(): void {
     this.emgTicks += 1;
+    if (this.anyViewing()) {
+      const update = this.motion.take();
+      if (update) this.broadcast("motion", update);
+    }
     if (this.recorder && this.emgTicks % 10 === 0) this.recorder.flush();
     const { restart, batches } = this.readings.take();
     if (!restart && batches.length === 0) return;
@@ -269,8 +296,32 @@ export class Daemon {
     this.stateChanged();
   }
 
+  private anyViewing(): boolean {
+    return [...this.viewing.values()].some((v) => v.readings || v.cursor);
+  }
+
+  /// Tell the controller who needs orientation, from every client's open views and the motion log.
+  private updateViewers(): void {
+    const views = [...this.viewing.values()];
+    const wasViewing = this.controller.state.motionStreams.orientation;
+    this.controller.setMotionViewers({
+      readings: views.some((v) => v.readings), cursor: views.some((v) => v.cursor), log: this.motionLog.isOn,
+    });
+    if (!wasViewing && this.anyViewing()) this.motion.reset();
+  }
+
+  private setViewing(client: unknown, page: unknown, visible: unknown): void {
+    if (page !== "readings" && page !== "cursor") throw new DaemonError("page must be readings or cursor");
+    if (typeof visible !== "boolean") throw new DaemonError("visible must be true or false");
+    const current = this.viewing.get(client) ?? { readings: false, cursor: false };
+    const next = { ...current, [page]: visible };
+    if (next.readings || next.cursor) this.viewing.set(client, next);
+    else this.viewing.delete(client);
+    this.updateViewers();
+  }
+
   /// One request from a client. Exposed for tests; the socket path goes through received().
-  async handle(method: string, params: Params): Promise<unknown> {
+  async handle(method: string, params: Params, client: unknown = "local"): Promise<unknown> {
     switch (method) {
       case "getState": return this.state();
       case "getConfig": return this.config;
@@ -303,6 +354,15 @@ export class Daemon {
       case "logs": return this.logLines;
       case "startRecording": await this.startRecording(params.path); return this.state();
       case "stopRecording": await this.stopRecording(); return this.state();
+      case "setAirCursor": {
+        if (typeof params.enabled !== "boolean") throw new DaemonError("enabled must be true or false");
+        if (!this.controller.setAirCursorEnabled(params.enabled)) {
+          throw new DaemonError(this.controller.state.airCursor.error
+            ?? "Turn on developer mode, connect your band, and enable controls to use the air cursor.");
+        }
+        return this.state();
+      }
+      case "setViewing": this.setViewing(client, params.page, params.visible); return this.state();
       default: throw new DaemonError(`Unknown method "${method}"`);
     }
   }
@@ -472,6 +532,11 @@ export class Daemon {
 
   // --- socket plumbing ---
 
+  private dropClient(socket: Client): void {
+    this.clients.delete(socket);
+    if (this.viewing.delete(socket)) this.updateViewers();
+  }
+
   private received(socket: Client, chunk: Buffer): void {
     socket.data.buffer += chunk.toString("utf8");
     let newline: number;
@@ -490,7 +555,7 @@ export class Daemon {
       id = message.id ?? null;
       if (typeof message.method !== "string") throw new DaemonError("Missing method");
       const params = typeof message.params === "object" && message.params !== null ? (message.params as Params) : {};
-      this.send(socket, { id, result: await this.handle(message.method, params) });
+      this.send(socket, { id, result: await this.handle(message.method, params, socket) });
     } catch (error) {
       this.send(socket, { id, error: messageOf(error) });
     }

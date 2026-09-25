@@ -1,5 +1,6 @@
 // Readings (developer mode): live raw EMG alongside gestures, an eight-channel trace of the last
-// second of sensor time, rates, and raw recording. Port of the Mac app's ReadingsPage.
+// second of sensor time, rates, and raw recording, then the band's motion: gyro traces and where
+// the forearm points. Port of the Mac app's ReadingsPage and MotionReadingsView.
 
 import QtCore
 import QtQuick
@@ -15,6 +16,15 @@ QQC2.ScrollView {
     readonly property var ctl: daemon.state.controller || ({})
     readonly property var readings: daemon.state.readings || ({})
     readonly property bool live: ctl.live === true
+    /// The latest motion update: forearm aim, rates, and delay.
+    property var motion: ({})
+
+    Connections {
+        target: daemon
+        function onMotion(data) {
+            readingsPage.motion = data;
+        }
+    }
     readonly property string status: {
         if (!live) return "Connect your band to start readings.";
         if (readings.pending) return "Waiting for the band to confirm…";
@@ -128,6 +138,54 @@ QQC2.ScrollView {
                     : "Records the original sensor payloads as JSONL. Values are ADC counts, not calibrated voltage."
                 enabled: !!recording || (readingsPage.readings.active === true && readingsPage.live)
                 onClicked: recording ? daemon.stopRecording() : saveDialog.open()
+            }
+        }
+
+        FormCard.FormHeader { title: "Motion" }
+        FormCard.FormCard {
+            FormCard.AbstractFormDelegate {
+                background: null
+                contentItem: ColumnLayout {
+                    spacing: Kirigami.Units.smallSpacing
+
+                    RowLayout {
+                        QQC2.Label { text: "±" + motionTrace.range + " °/s"; opacity: 0.6; Layout.fillWidth: true }
+                        Repeater {
+                            model: [["x", Kirigami.Theme.highlightColor], ["y", Kirigami.Theme.textColor], ["z", Kirigami.Theme.disabledTextColor]]
+                            delegate: RowLayout {
+                                required property var modelData
+                                spacing: Kirigami.Units.smallSpacing
+                                Rectangle { implicitWidth: 10; implicitHeight: 2; color: modelData[1] }
+                                QQC2.Label { text: modelData[0]; opacity: 0.6 }
+                            }
+                        }
+                    }
+                    MotionTrace {
+                        id: motionTrace
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Kirigami.Units.gridUnit * 6
+
+                        QQC2.Label {
+                            anchors.centerIn: parent
+                            visible: motionTrace.empty
+                            opacity: 0.7
+                            text: readingsPage.live ? "Waiting for motion…" : "Connect your band to see its motion."
+                        }
+                    }
+                }
+            }
+            FormCard.FormDelegateSeparator {}
+            FormCard.FormTextDelegate {
+                readonly property var aim: readingsPage.motion.aim
+                text: aim ? "Compass " + Math.round(aim.azimuth) + "° · elevation " + Math.round(aim.elevation) + "°" : "Forearm: –"
+                description: "Where the forearm points. The compass angle is relative: the band has no magnetometer, so only elevation is absolute."
+            }
+            FormCard.FormDelegateSeparator {}
+            FormCard.FormTextDelegate {
+                readonly property real delay: readingsPage.motion.delay || 0
+                text: Math.round(readingsPage.motion.gyroRate || 0) + " / " + Math.round(readingsPage.motion.orientationRate || 0) + " Hz gyro / orientation"
+                description: "Arrival delay " + (delay < 1 ? Math.round(delay * 1000) + " ms" : delay.toFixed(1) + " s")
+                    + ". Gyro scale is observed, not calibrated."
             }
         }
 

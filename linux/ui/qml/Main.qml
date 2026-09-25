@@ -26,13 +26,20 @@ Kirigami.ApplicationWindow {
     readonly property var ctl: st.controller || ({})
     readonly property bool paired: !!st.band && st.enrolled === true
 
-    // Leaving developer mode hides Readings; don't stay on a hidden tab.
+    // Leaving developer mode hides Readings and Cursor; don't stay on a hidden tab.
     Connections {
         target: daemon
         function onConfigChanged() {
-            if (daemon.config.developerMode !== true && root.currentPage === 3) root.currentPage = 2;
+            if (daemon.config.developerMode !== true && root.currentPage >= 3) root.currentPage = 2;
         }
     }
+
+    // Readings and Cursor show the band's motion, which the band only streams while someone looks.
+    readonly property bool pagesOnScreen: root.visible && root.paired && !root.showingSetup && daemon.config.developerMode === true
+    readonly property bool viewingReadings: pagesOnScreen && root.currentPage === 3
+    readonly property bool viewingCursor: pagesOnScreen && root.currentPage === 4
+    onViewingReadingsChanged: daemon.setViewing("readings", viewingReadings)
+    onViewingCursorChanged: daemon.setViewing("cursor", viewingCursor)
 
     /// The display title for an action id, from the daemon's catalog.
     function actionTitle(id) {
@@ -161,6 +168,12 @@ Kirigami.ApplicationWindow {
                             width: visible ? implicitWidth : 0
                             onClicked: root.currentPage = 3
                         }
+                        QQC2.TabButton {
+                            text: "Cursor"
+                            visible: daemon.config.developerMode === true
+                            width: visible ? implicitWidth : 0
+                            onClicked: root.currentPage = 4
+                        }
                     }
                     Item { Layout.fillWidth: true }
                     QQC2.ToolButton {
@@ -190,6 +203,7 @@ Kirigami.ApplicationWindow {
                     GesturesPage {}
                     BandPage {}
                     ReadingsPage {}
+                    CursorPage {}
                 }
 
                 PairingView {

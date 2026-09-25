@@ -1,11 +1,14 @@
 // Environment checks shared by `kinesis doctor` and the app's diagnostics.
 
+import { constants } from "node:fs";
+import * as fs from "node:fs/promises";
 import { KdeBackend } from "./actions";
 import * as bluez from "./bluez";
 import { configPath, loadConfig } from "./config";
 import type { BandDevice } from "./gestures";
 import { BandIdentity } from "./identity";
 import { AF_BLUETOOTH, BTPROTO_L2CAP, SOCK_SEQPACKET, libc } from "./l2cap";
+import { listKeyboards } from "./keys";
 import { MetaSessionStore } from "./meta-auth";
 
 export interface DoctorRow {
@@ -36,6 +39,12 @@ export async function doctorRows(): Promise<DoctorRow[]> {
   check("KDE backend", KdeBackend.available(), KdeBackend.available() ? "qdbus found" : "not KDE or qdbus missing; use the command backend");
   const ydotool = Bun.which("ydotool");
   check("ydotool", ydotool !== null, ydotool ? "used for Escape and tab switching" : "optional; needed for dismiss/previousTab/nextTab on KDE");
+  const uinput = await access("/dev/uinput", constants.W_OK);
+  check("Air cursor mouse", uinput, uinput ? "/dev/uinput is writable" : "optional; join the input group to use the air cursor");
+  const keyboards = listKeyboardsSafely();
+  const readable = await Promise.all(keyboards.map((k) => access(`/dev/input/${k.node}`, constants.R_OK)));
+  const count = readable.filter(Boolean).length;
+  check("Air cursor keys", count > 0, count > 0 ? `Escape and Alt from ${count} keyboard${count === 1 ? "" : "s"}` : "optional; join the input group so Escape stops the cursor");
   const config = await loadConfig();
   check("Saved band", config.band !== undefined, config.band ? describeDevice(config.band) : "pair a band first");
   if (config.band) {
@@ -63,6 +72,18 @@ export async function doctorRows(): Promise<DoctorRow[]> {
   }
   check("Config", true, configPath());
   return rows;
+}
+
+async function access(path: string, mode: number): Promise<boolean> {
+  return fs.access(path, mode).then(() => true, () => false);
+}
+
+function listKeyboardsSafely(): ReturnType<typeof listKeyboards> {
+  try {
+    return listKeyboards();
+  } catch {
+    return [];
+  }
 }
 
 /// Whether the running bluetooth module is the one kernel-fix/install.sh put in updates/kinesis.

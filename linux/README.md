@@ -35,9 +35,11 @@ that the window has:
 - **band column**: status, battery, gesture count, and the one next step (pair, connect, enable or pause controls)
 - **overview**: a 3d hand that mirrors the band (it lights the fingertips of each gesture, acts it out, holds a pinch as long as you do, and turns with your wrist on the dial, inside the band's ring of electrodes), what the gesture did, and your assignments
 - **gestures**: an action for each swipe and tap, and the pinch dial's target and sensitivity. changes apply immediately
-- **band**: wrist, start automatically, start at login, meta account, diagnostics with a test action, and forget this band
+- **band**: wrist, start automatically, start at login, meta account, diagnostics with a test action, forget this band, and developer mode
+- **readings** (developer mode): live raw semg on all eight channels, raw recording as jsonl, and the band's motion: gyro traces, where the forearm points, sample rates, and arrival delay
+- **cursor** (developer mode): the experimental [air cursor](#air-cursor)
 
-the tray menu has the status, battery, the next step, disconnect, open, and quit. quitting stops the
+the tray menu has the status, battery, the next step, disconnect, the air cursor (developer mode), open, and quit. quitting stops the
 service too. the command line still works for scripting; `run`, `hand` and `enroll` refuse while the
 service holds the band (`systemctl --user stop kinesis.service` first).
 
@@ -46,7 +48,7 @@ against canned data and fails on any qml warning (no band or service needed).
 
 the service speaks newline-delimited json on `$XDG_RUNTIME_DIR/kinesis/daemon.sock` (0600): requests
 `{id, method, params}`, replies `{id, result|error}`, and pushed `{event, data}` for state, config,
-gesture, action, dial, pairing, and log. see `src/daemon.ts`.
+gesture, action, dial, pairing, log, emg, and motion. see `src/daemon.ts`.
 
 ## run it
 
@@ -116,6 +118,36 @@ kinesis config set commands.playPause '["playerctl","play-pause"]'
 
 settings live in `~/.config/kinesis/config.json` (`kinesis config path`).
 
+## air cursor
+
+experimental, as on the mac: turn on developer mode (band page), then the cursor page or the tray.
+move your forearm to move the pointer, like a mouse. pinch your index to click, hold the pinch to
+drag, pinch your middle finger to right-click. thumb swipes keep their actions. escape turns it off;
+hold alt to move your arm without moving the pointer.
+
+it's a port of upstream's pointer model (`src/air-cursor.ts`, from `AirCursor.swift` and its
+[notes](https://github.com/callbacked/kinesis/blob/main/docs/cursor-orientation.md)): the band's
+orientation quaternion says where the forearm points and the gyro how fast it turns; a wrist twist
+never moves the pointer; a 1€ filter and a stillness threshold hold it still when your arm is; slow
+aiming gets 0.6× and flicks up to the flick boost; a pinch's drift is absorbed; movement plays back
+30 ms behind the arm so it's smooth; and a gentle pull toward where the arm started keeps pointer and
+arm from walking apart. the three levers on the cursor page are speed (points per degree), flick
+boost, and steadiness, also `kinesis config set cursor.speed 50` and friends.
+
+on linux the pointer is a virtual mouse the service makes with uinput, set to a flat acceleration
+profile through kwin, so clicks land wherever the pointer is. escape and alt are read from your
+keyboards' evdev nodes (passively, only those keys, only while the cursor is on), since wayland has
+no global key monitor. both need the `input` group:
+
+```sh
+sudo usermod -aG input $USER    # then log out and back in
+```
+
+`kinesis doctor` shows whether both work. the orientation stream only runs while the cursor, the
+readings page, or the cursor page needs it; upstream found the link congested with it always on.
+`KINESIS_MOTION_LOG=/path/motion.jsonl` makes the service log every gyro, orientation, and gesture
+event with both clocks. upstream's calibration and practice lab are lab-build tools and aren't ported.
+
 ## handedness
 
 the band's own hand setting is read on every connect and the wrist dial is mirrored for the left hand, as in the mac app. to change it on the band:
@@ -170,4 +202,6 @@ patched module is loaded.
 - the l2cap receive mtu is requested at 8 kib; kernels that reject setting it before connect keep their default, which still carries the band's frames.
 - previous/next window use kwin's walk-through shortcuts, which switch immediately when invoked over d-bus.
 - brightness uses powerdevil, so external displays without ddc support won't respond.
-- no raw semg. see [neural-band-poc](https://github.com/callbacked/neural-band-poc) for that.
+- raw semg is readings and recording only (developer mode); nothing is decoded from it.
+- the air cursor can't see the pointer's real position (wayland keeps it private), so its drift
+  correction follows what it has moved itself. it has no calibration.

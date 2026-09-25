@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import * as bluez from "./bluez";
 import type { CeremonyPairData, CeremonyPairRequestData } from "./ceremony";
-import type { BandDevice, BandEvent, BandHand } from "./gestures";
+import { ALL_MOTION, type BandDevice, type BandEvent, type BandHand, type MotionStreams } from "./gestures";
 import { L2capChannel, type SecurityLevel } from "./l2cap";
 import { BandSession, type SessionOptions } from "./session";
 import { concat, hex } from "./wire";
@@ -85,6 +85,7 @@ export class BandConnection {
   private release: (() => Promise<void>) | undefined;
   private pairClient: BandPairClient | undefined;
   private ceremonyBusy = false;
+  private motionMode: MotionStreams = { ...ALL_MOTION };
 
   constructor(private readonly log: Logger) {}
 
@@ -140,6 +141,33 @@ export class BandConnection {
     }
     this.channel.write(this.session.setHandedness(hand, now()));
     this.log.notice(`Requested band hand: ${hand}`);
+  }
+
+  /// Which motion streams to keep on. Applied now if connected, or at the next subscription.
+  setMotionStreams(streams: MotionStreams): void {
+    this.motionMode = { ...streams };
+    const session = this.session;
+    if (!session || this.stopping || this.disconnecting || !this.channel) return;
+    try {
+      const bytes = session.setMotionStreams(streams, now());
+      if (bytes.length) this.channel.write(bytes);
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  /// Turn the motion streams off and on again, to clear a backed-up stream.
+  restartMotionStreams(): void {
+    const session = this.session;
+    if (!session || this.stopping || this.disconnecting || !this.channel) return;
+    try {
+      const bytes = session.restartMotionStreams(now());
+      if (!bytes.length) return;
+      this.log.notice("Restarting the motion streams to clear a backlog");
+      this.channel.write(bytes);
+    } catch (error) {
+      this.fail(error);
+    }
   }
 
   /// Turn raw sEMG on or off on the live subscription (gestures stay on).
@@ -263,7 +291,7 @@ export class BandConnection {
     if (this.disconnecting) return;
     try {
       this.log.info("L2CAP channel opened");
-      this.session = new BandSession(session);
+      this.session = new BandSession({ ...session, motion: this.motionMode });
       this.session.onFrame = (frame) => this.log.info(`  frame ch=0x${frame.channel.toString(16)} words=[${frame.words.map((w) => "0x" + w.toString(16)).join(",")}] len=${frame.length}`);
       this.session.onTransport = (record) => this.log.info(`  transport record ${hex(record.subarray(0, 24))}${record.length > 24 ? `… (${record.length} B)` : ""}`);
       this.channel?.write(this.session.request());
@@ -344,6 +372,10 @@ export class BandConnection {
   private emit(event: BandEvent): void {
     if (this.disconnecting || this.stopping) return;
     if (event.payload.type === "handedness") this.log.notice(`Band hand confirmed: ${event.payload.hand}`);
+    if (event.payload.type === "motionStreams") {
+      const { streams, confirmedAfter, accepted } = event.payload;
+      this.log.notice(`Motion streams gyro ${streams.gyro}, orientation ${streams.orientation}; band answered after ${confirmedAfter.toFixed(2)}s, as asked: ${accepted}`);
+    }
     if (event.payload.type === "batteryStatus") {
       const status = event.payload.status;
       this.log.info(status ? `Battery status: ${status.level}%, charging ${status.charging ?? "unknown"}` : "Battery status unavailable");
@@ -380,6 +412,13 @@ export class BandConnection {
     const session = this.session;
     if (!this.stopping && session) {
       for (const event of session.tick(time)) this.emit(event);
+      try {
+        const motion = session.flushMotion(time);
+        if (motion.length) this.channel?.write(motion);
+      } catch (error) {
+        this.fail(error);
+        return;
+      }
       // Upstream polls BatteryInfoReq every 5 s while streaming; it is also regular host traffic.
       if (session.streamsEnabled && time >= this.nextBatteryStatusRead) {
         this.nextBatteryStatusRead = time + 5;

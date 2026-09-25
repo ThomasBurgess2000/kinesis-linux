@@ -44,6 +44,14 @@ export class SyntheticBand {
   private ourPoint!: Uint8Array;
   private streamSeq = 0;
   private rawOn = false;
+  gyroOn = true;
+  orientationOn = true;
+  /// Refuse stream changes after the subscription (status 0), as a band might.
+  refuseMotion = false;
+  /// Take stream requests without answering them, as a band that never replies.
+  muteStreams = false;
+  /// The stream control fields of the last subscription request the band answered.
+  lastControl: ProtoFields | undefined;
   /// Events emitted while the constructor drove setup to a live stream.
   readonly setupEvents: BandEvent[] = [];
 
@@ -170,9 +178,17 @@ export class SyntheticBand {
         return [this.encrypt(BandWire.frame(6, [0x02000315], concat(BandWire.field(1, id), BandWire.field(2, 1), BandWire.field(6, config))))];
       }
       // Stream control: gestures and motion on; raw sEMG (flag 2) as last requested.
+      if (this.muteStreams) return [];
       const control = new ProtoFields(fields.bytes(4));
+      this.lastControl = control;
       if (control.contains(2)) this.rawOn = control.integer(2) === 1n;
-      const flags = concat(BandWire.field(2, this.rawOn ? 1 : 0), BandWire.field(3, 1), BandWire.field(6, 1), BandWire.field(8, 1));
+      if (control.contains(6)) this.gyroOn = control.integer(6) === 1n;
+      if (control.contains(8)) this.orientationOn = control.integer(8) === 1n;
+      if (this.refuseMotion && id > 6n) {
+        return [this.encrypt(BandWire.frame(5, [0x02000315], concat(BandWire.field(1, id), BandWire.field(2, 0))))];
+      }
+      const flags = concat(BandWire.field(2, this.rawOn ? 1 : 0), BandWire.field(3, 1), BandWire.field(6, this.gyroOn ? 1 : 0),
+        BandWire.field(8, this.orientationOn ? 1 : 0));
       return [this.encrypt(BandWire.frame(5, [0x02000315], concat(BandWire.field(1, id), BandWire.field(2, 1), BandWire.field(5, flags))))];
     }
     return [];
@@ -188,6 +204,24 @@ export class SyntheticBand {
       BandWire.field(3, options.finger ?? 2), BandWire.field(4, action), BandWire.field(5, options.derived ?? 0));
     const frame = BandWire.frame(0x8005, [0x0200020d], payload);
     return this.session.feed(this.encrypt(frame), 100 + now).events;
+  }
+
+  /// Send one gyro sample (raw counts) stamped `timestampUs` on the band's clock.
+  gyro(values: [number, number, number], timestampUs: number, now = 150): BandEvent[] {
+    const samples = new Uint8Array(6);
+    const view = new DataView(samples.buffer);
+    values.forEach((v, i) => view.setInt16(i * 2, v, true));
+    const payload = concat(BandWire.field(1, ++this.streamSeq), BandWire.field(2, timestampUs), BandWire.field(3, samples));
+    return this.session.feed(this.encrypt(BandWire.frame(5, [0x0200020f], payload)), now).events;
+  }
+
+  /// Send one orientation sample: a quaternion in wire order w, x, y, z.
+  orientation(values: [number, number, number, number], timestampUs: number, now = 150): BandEvent[] {
+    const samples = new Uint8Array(16);
+    const view = new DataView(samples.buffer);
+    values.forEach((v, i) => view.setFloat32(i * 4, v, true));
+    const payload = concat(BandWire.field(1, ++this.streamSeq), BandWire.field(2, timestampUs), BandWire.field(3, samples));
+    return this.session.feed(this.encrypt(BandWire.frame(5, [0x02000212], payload)), now).events;
   }
 
   /// Send one raw sEMG batch: sample s, channel c reads 1000 + 10·s + c.

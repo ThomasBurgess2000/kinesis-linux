@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { LoggingBackend } from "../src/actions";
 import { DEFAULT_CONFIG, saveConfig } from "../src/config";
 import type { BandOperation, Logger } from "../src/connection";
-import type { ConnectionLike } from "../src/controller";
+import type { ConnectionLike, CursorOptions } from "../src/controller";
 import { Daemon, DaemonError, daemonRunning } from "../src/daemon";
 import type { PairProgress } from "../src/enroll";
-import type { BandEvent, BandGesture, BandHand } from "../src/gestures";
+import type { BandEvent, BandGesture, BandHand, MotionStreams } from "../src/gestures";
 import { BandIdentity, SigningKey } from "../src/identity";
 import { BandWire, concat } from "../src/wire";
 
@@ -32,6 +32,14 @@ class FakeConnection implements ConnectionLike {
   rawEMG: boolean[] = [];
   setRawEMG(enabled: boolean): void {
     this.rawEMG.push(enabled);
+  }
+  motion: MotionStreams[] = [];
+  restarts = 0;
+  setMotionStreams(streams: MotionStreams): void {
+    this.motion.push(streams);
+  }
+  restartMotionStreams(): void {
+    this.restarts += 1;
   }
 }
 
@@ -112,7 +120,9 @@ afterEach(async () => {
   daemon = undefined;
 });
 
-async function startDaemon(options: { withBand?: boolean; connection?: FakeConnection; backend?: LoggingBackend; pairing?: object } = {}) {
+async function startDaemon(options: {
+  withBand?: boolean; connection?: FakeConnection; backend?: LoggingBackend; pairing?: object; cursor?: CursorOptions;
+} = {}) {
   const configPath = join(dir, "config.json");
   const config = structuredClone(DEFAULT_CONFIG);
   if (options.withBand) config.band = band;
@@ -124,6 +134,7 @@ async function startDaemon(options: { withBand?: boolean; connection?: FakeConne
     pairing: options.pairing, doctor: async () => [{ name: "Test", ok: true, detail: "fine" }],
     removeFromBluez: async () => {}, clock: () => clock.now,
     watchSleep: (onChange) => { setSleeping = onChange; return () => {}; },
+    cursor: options.cursor ?? { openPointer: () => { throw new Error("no virtual mouse in tests"); } },
   });
   await daemon.start();
   const client = await Client.open(join(dir, "run", "daemon.sock"));
@@ -308,4 +319,48 @@ test("developer mode's live EMG reaches the viewer and records as JSONL", async 
   await client.call("setConfig", { patch: { developerMode: false } });
   expect(connection.rawEMG).toEqual([true, false]);
   client.close();
+});
+
+test("the air cursor turns on over the socket, and open motion views get the orientation stream", async () => {
+  const connection = new FakeConnection();
+  const buttons: string[] = [];
+  const cursor: CursorOptions = {
+    openPointer: () => ({ move() {}, button: (b, down) => { buttons.push(`${b} ${down}`); }, close() {} }),
+    watchKeys: () => ({ start: () => 0, stop() {} }),
+    frames: "manual",
+  };
+  const { client } = await startDaemon({ withBand: true, connection, cursor });
+  connection.emit!({ payload: { type: "connected" }, receivedAt: clock.now });
+  connection.emit!({ payload: { type: "handedness", hand: "right" }, receivedAt: clock.now });
+  connection.emit!({ payload: { type: "heartbeat" }, receivedAt: clock.now });
+  // Developer mode first.
+  expect((await client.call("setAirCursor", { enabled: true })).error).toContain("developer mode");
+  await client.call("setConfig", { patch: { developerMode: true, cursor: { speed: 60 } } });
+  expect((await client.call("setConfig", { patch: { cursor: { speed: 500 } } })).error).toContain("between 20 and 100");
+  const on = await client.call("setAirCursor", { enabled: true });
+  expect(on.result.controller.airCursor).toMatchObject({ enabled: true, available: true });
+  expect(connection.motion.at(-1)).toEqual({ gyro: true, orientation: true });
+  clock.now = 100.5;
+  connection.emit!({ payload: { type: "gesture", gesture: {
+    receivedAt: 100.5, finger: "index", action: "press", derivedAction: "unknown", synthetic: false, sequence: 9n, timestampUs: 9n,
+  } }, receivedAt: 100.5 });
+  expect(buttons).toEqual(["left true"]);
+  await client.call("setAirCursor", { enabled: false });
+  expect(buttons).toEqual(["left true", "left false"]);
+  expect(connection.motion.at(-1)).toEqual({ gyro: true, orientation: false });
+
+  // The readings page asks for motion; its samples come back as "motion" events.
+  await client.call("setViewing", { page: "readings", visible: true });
+  expect(connection.motion.at(-1)).toEqual({ gyro: true, orientation: true });
+  connection.emit!({ payload: { type: "gyro", timestampUs: 5_000_000n, values: [100, 0, 0] }, receivedAt: clock.now });
+  connection.emit!({ payload: { type: "orientation", timestampUs: 5_000_000n, values: [1, 0, 0, 0] }, receivedAt: clock.now });
+  const motion = await client.until((e) => e.event === "motion" && e.data.aim !== null);
+  const [at, x] = motion.data.gyro.at(-1);
+  expect(at).toBe(clock.now);
+  expect(x).toBeCloseTo(7); // 100 counts at the observed 0.07 °/s per count
+  expect(motion.data.aim.elevation).toBeCloseTo(0);
+  // A client that goes away takes its views with it.
+  client.close();
+  await Bun.sleep(50);
+  expect(connection.motion.at(-1)).toEqual({ gyro: true, orientation: false });
 });

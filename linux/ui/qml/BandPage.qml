@@ -84,7 +84,7 @@ QQC2.ScrollView {
         FormCard.FormCard {
             FormCard.FormSwitchDelegate {
                 text: "Developer mode"
-                description: "Unlocks readings: live muscle signals (raw EMG) and raw recording."
+                description: "Unlocks readings (live muscle signals and motion, raw recording) and the experimental air cursor."
                 checked: daemon.config.developerMode === true
                 onToggled: daemon.setConfig({ developerMode: checked })
             }

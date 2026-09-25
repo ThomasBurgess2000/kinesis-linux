@@ -14,7 +14,7 @@ import { OwnershipCeremony, ceremonyFailureMessage } from "./ceremony";
 import { PinchDial } from "./dial";
 import { type BandEnrollmentIdentity, BandIdentityMismatchError, verifyPreimage } from "./identity";
 import { parseEMGConfiguration } from "./emg";
-import type { BandEvent, BandGesture, BandHand } from "./gestures";
+import { ALL_MOTION, type BandEvent, type BandGesture, type BandHand, type MotionStreams, sameMotion } from "./gestures";
 import { BandProtocolError, BandWire, DataXReceiver, type DataXFrame, ProtoFields, be16, be32, concat } from "./wire";
 
 interface HandRequest {
@@ -30,7 +30,11 @@ export interface SessionOptions {
   ceremony?: OwnershipCeremony;
   /// Turn raw sEMG on as soon as the input subscription is up (readings were on before a reconnect).
   rawEMG?: boolean;
+  /// The motion streams to subscribe to (default: gyro and orientation).
+  motion?: MotionStreams;
 }
+
+const NO_MOTION: MotionStreams = { gyro: false, orientation: false };
 
 type RawStage = "config" | "query" | "update";
 
@@ -104,11 +108,14 @@ export class BandSession {
   /// The parameters we declare in our EnableEncryption (field 5). Each side sends with the set it
   /// declared, so this keys our TX while the band's declared set (negotiatedParams) keys RX.
   declaredParams = 3n;
-  /// Subscribed streams: 3 gestures, 6 gyro, 8 quaternion. KINESIS_STREAMS (e.g. "3") narrows it
-  /// for experiments; the pinch dial needs gyro.
-  private readonly streamFields = process.env.KINESIS_STREAMS
-    ? process.env.KINESIS_STREAMS.split(",").map(Number).filter((f) => [2, 3, 6, 8].includes(f))
-    : [3, 6, 8];
+  /// Gestures (3) are always on. Gyro (6) and orientation (8) can be switched while connected.
+  private motion: MotionStreams;
+  private static readonly allStreamFields = [3, 6, 8];
+  /// A motion change waiting to go out, and the one the band hasn't answered yet.
+  private wantedMotion: MotionStreams | undefined;
+  private motionRequest: { id: bigint; wanted: MotionStreams; sentAt: number } | undefined;
+  /// After a restart request: the streams to turn back on once "off" is confirmed.
+  private motionAfterRestart: MotionStreams | undefined;
   private readonly streamChannel = 0x8005;
   private readonly configurationChannel: number;
   private setupStage: SetupStage = "link";
@@ -147,6 +154,18 @@ export class BandSession {
     this.enrollment = options.enrollment;
     this.ceremony = options.ceremony;
     this.rawEMG = options.rawEMG ?? false;
+    // KINESIS_STREAMS (e.g. "3,6") narrows the motion streams for experiments; the dial needs gyro.
+    const fields = process.env.KINESIS_STREAMS?.split(",").map(Number);
+    this.motion = fields ? { gyro: fields.includes(6), orientation: fields.includes(8) } : { ...(options.motion ?? ALL_MOTION) };
+  }
+
+  /// Subscribed streams: 3 gestures, 6 gyro, 8 quaternion.
+  private get streamFields(): number[] {
+    return [3, ...(this.motion.gyro ? [6] : []), ...(this.motion.orientation ? [8] : [])];
+  }
+
+  get motionStreams(): MotionStreams {
+    return { ...this.motion };
   }
 
   private get publicKey(): Uint8Array {
@@ -271,6 +290,18 @@ export class BandSession {
       this.rawRequest = undefined;
       events.push(event({ type: "rawEMGFailure", message: "The band didn't confirm the EMG change. Turn readings off, then try again." }, time));
     }
+    // An unanswered stream change is given up after 8 s, so a later one can go out.
+    const pending = this.motionRequest;
+    if (pending && time - pending.sentAt >= 8 && !this.stopping) {
+      this.motionRequest = undefined;
+      // A restart gives up only when its own off request fails. An earlier change failing leaves
+      // the restart waiting to go out.
+      if (this.motionAfterRestart && sameMotion(pending.wanted, NO_MOTION)) {
+        this.motionAfterRestart = undefined;
+        this.wantedMotion = undefined;
+      }
+      events.push(event({ type: "motionStreams", streams: { ...this.motion }, confirmedAfter: time - pending.sentAt, accepted: false }, time));
+    }
     return events;
   }
 
@@ -293,11 +324,58 @@ export class BandSession {
     return this.rawStreamUpdate(this.rawRequestID, false);
   }
 
-  /// Every stream field set explicitly, so none is left to the band's default.
   private rawStreamUpdate(id: bigint, enabled: boolean): Uint8Array {
     this.rawRequested = true;
-    const control = concat(BandWire.field(2, enabled ? 1 : 0), ...this.streamFields.map((field) => BandWire.field(field, 1)));
+    // A motion change in flight is where motion is going: this frame must not undo it.
+    const control = this.streamControl(this.motionRequest?.wanted ?? this.motion, enabled);
     return this.encrypt(BandWire.frame(this.streamChannel, [], concat(BandWire.field(1, id), BandWire.field(4, control))));
+  }
+
+  /// Every stream field, on or off explicitly, so none is left to the band's default.
+  private streamControl(motion: MotionStreams, raw: boolean | undefined): Uint8Array {
+    return concat(raw === undefined ? new Uint8Array() : BandWire.field(2, raw ? 1 : 0), BandWire.field(3, 1),
+      BandWire.field(6, motion.gyro ? 1 : 0), BandWire.field(8, motion.orientation ? 1 : 0));
+  }
+
+  /// Ask for these motion streams. Before the subscription it only changes what the subscription
+  /// asks for. While another stream change is in flight it waits; flushMotion() sends it when the
+  /// way is clear.
+  setMotionStreams(wanted: MotionStreams, time: number): Uint8Array {
+    if (this.stopping) return new Uint8Array();
+    this.motionAfterRestart = undefined;
+    this.wantedMotion = { ...wanted };
+    return this.flushMotion(time);
+  }
+
+  /// Turn the motion streams off and, once the band confirms, on again (to clear a backlog).
+  restartMotionStreams(time: number): Uint8Array {
+    if (this.stopping || !this.streamsEnabled || this.motionAfterRestart || sameMotion(this.motion, NO_MOTION)) return new Uint8Array();
+    const restore = this.wantedMotion ?? this.motion;
+    this.wantedMotion = { ...NO_MOTION };
+    this.motionAfterRestart = { ...restore };
+    return this.flushMotion(time);
+  }
+
+  /// Sends a waiting motion change if nothing else is in flight. Safe to call often.
+  flushMotion(time: number): Uint8Array {
+    const wanted = this.wantedMotion;
+    // While a change is in flight, compare against nothing yet: it may still move `motion`.
+    if (this.stopping || !wanted || this.motionRequest) return new Uint8Array();
+    if (sameMotion(wanted, this.motion)) {
+      this.wantedMotion = undefined;
+      return new Uint8Array();
+    }
+    // The subscription hasn't gone out yet: it will simply ask for these.
+    if (this.setupStage !== "input") {
+      this.motion = { ...wanted };
+      this.wantedMotion = undefined;
+      return new Uint8Array();
+    }
+    if (!this.streamsEnabled || this.rawRequest) return new Uint8Array();
+    this.rawRequestID += 1n;
+    this.motionRequest = { id: this.rawRequestID, wanted, sentAt: time };
+    const control = this.streamControl(wanted, this.rawRequested ? this.rawEMG : undefined);
+    return this.encrypt(BandWire.frame(this.streamChannel, [], concat(BandWire.field(1, this.rawRequestID), BandWire.field(4, control))));
   }
 
   private receiveRaw(frame: DataXFrame, fields: ProtoFields, time: number, outgoing: Uint8Array[]): BandEvent[] | undefined {
@@ -331,7 +409,7 @@ export class BandSession {
       case "update": {
         this.rawRequest = undefined;
         const flags = new ProtoFields(fields.bytes(5));
-        if (!this.streamFields.every((f) => flags.integer(f) === 1n)) {
+        if (flags.integer(3) !== 1n) {
           throw new BandProtocolError("The band stopped gesture streams during the EMG change. Reconnect with readings off.");
         }
         if (flags.integer(2) !== (pending.enabled ? 1n : 0n)) {
@@ -428,6 +506,9 @@ export class BandSession {
     if (this.stopping) return new Uint8Array();
     this.stopping = true;
     this.handRequest = undefined;
+    this.motionRequest = undefined;
+    this.wantedMotion = undefined;
+    this.motionAfterRestart = undefined;
     if (!this.transmitter || this.setupStage !== "input") return new Uint8Array();
     return this.streamRequest(4n, false, this.rawRequested);
   }
@@ -543,14 +624,46 @@ export class BandSession {
     return [];
   }
 
-  /// `includeRaw` also sets raw sEMG (flag 2), once it has been requested this session.
+  /// Subscribe (true), stop (false), or query (undefined). Stopping turns every stream off, whichever
+  /// were on, and raw sEMG (flag 2) too once it has been requested this session (`includeRaw`).
   private streamRequest(id: bigint, enabled: boolean | undefined, includeRaw = false): Uint8Array {
-    const fields = includeRaw ? [2, ...this.streamFields] : this.streamFields;
     const control = enabled === undefined
       ? new Uint8Array()
-      : concat(...fields.map((field) => BandWire.field(field, enabled ? 1 : 0)));
+      : enabled
+        ? this.streamControl(this.motion, undefined)
+        : concat(...[...(includeRaw ? [2] : []), ...BandSession.allStreamFields].map((field) => BandWire.field(field, 0)));
     return this.encrypt(BandWire.frame(this.streamChannel, id === 2n ? [0x8100ce56, 0x02000314] : [],
       concat(BandWire.field(1, id), BandWire.field(4, control))));
+  }
+
+  /// The band's answer to a motion stream change: what is on now, and whether it's what was asked.
+  private receiveMotionStreams(pending: { id: bigint; wanted: MotionStreams; sentAt: number }, fields: ProtoFields, time: number,
+    outgoing: Uint8Array[]): BandEvent[] {
+    this.motionRequest = undefined;
+    if (this.stopping) return [];
+    const confirmedAfter = time - pending.sentAt;
+    let accepted = false;
+    if (fields.integer(2) !== 1n || !fields.contains(5)) {
+      if (this.motionAfterRestart && !sameMotion(pending.wanted, NO_MOTION)) {
+        // An earlier change was refused. The restart still goes out, then restores what is on now.
+        this.motionAfterRestart = { ...this.motion };
+      } else {
+        this.wantedMotion = undefined;
+        this.motionAfterRestart = undefined;
+      }
+    } else {
+      const flags = new ProtoFields(fields.bytes(5));
+      if (flags.integer(3) !== 1n) throw new BandProtocolError("The band input subscription stopped");
+      this.motion = { gyro: flags.integer(6) === 1n, orientation: flags.integer(8) === 1n };
+      if (sameMotion(this.motion, NO_MOTION) && this.motionAfterRestart) {
+        this.wantedMotion = this.motionAfterRestart;
+        this.motionAfterRestart = undefined;
+      }
+      accepted = sameMotion(this.motion, pending.wanted);
+    }
+    const next = this.flushMotion(time);
+    if (next.length) outgoing.push(next);
+    return [event({ type: "motionStreams", streams: { ...this.motion }, confirmedAfter, accepted }, time)];
   }
 
   private engagementEvents(time: number): BandEvent[] {
@@ -650,11 +763,15 @@ export class BandSession {
     if (kind === 0x02000315 && !sameChannel(frame.channel, this.streamChannel)) return [];
     if (kind === 0x02000315) {
       const request = fields.integer(1);
+      const motionRequest = this.motionRequest;
+      if (motionRequest && request === motionRequest.id) return this.receiveMotionStreams(motionRequest, fields, time, outgoing);
       if (request === 3n || request === 5n) {
         if (this.stopping) return [];
         if (fields.integer(2) !== 1n) throw new BandProtocolError("The band rejected the input subscription");
         const flags = new ProtoFields(fields.bytes(5));
-        this.streamsEnabled = this.streamFields.every((f) => flags.contains(f) && flags.integer(f) === 1n);
+        // A status query can land while a motion change is on its way, so only gestures must be on.
+        const required = request === 3n ? this.streamFields : [3];
+        this.streamsEnabled = required.every((f) => flags.contains(f) && flags.integer(f) === 1n);
         if (!this.streamsEnabled) throw new BandProtocolError("The band input subscription stopped");
         if (request === 3n && this.rawEMG && !this.rawRequest) outgoing.push(this.setRawEMGEnabled(true, time));
         if (!this.streaming) {
@@ -663,7 +780,7 @@ export class BandSession {
         }
       } else if (request === 4n && fields.integer(2) === 1n && fields.contains(5)) {
         const flags = new ProtoFields(fields.bytes(5));
-        const stopped = this.rawRequested ? [2, ...this.streamFields] : this.streamFields;
+        const stopped = [...(this.rawRequested ? [2] : []), ...BandSession.allStreamFields];
         this.stopAcknowledged = stopped.every((f) => flags.contains(f) && flags.integer(f) === 0n);
       }
       return [];
@@ -715,6 +832,7 @@ export class BandSession {
       const values: [number, number, number] = [view.getInt16(0, true), view.getInt16(2, true), view.getInt16(4, true)];
       const delta = this.dial.gyro(timestamp, values, time);
       events.push(...this.engagementEvents(time));
+      events.push(event({ type: "gyro", timestampUs: timestamp, values }, time));
       if (delta !== undefined) {
         this.dialPending += delta;
         if (time - this.lastDial >= 0.02) {
@@ -724,11 +842,12 @@ export class BandSession {
         }
       }
     } else {
-      const values = [0, 1, 2, 3].map((i) => view.getFloat32(i * 4, true));
+      const values: [number, number, number, number] = [view.getFloat32(0, true), view.getFloat32(4, true), view.getFloat32(8, true), view.getFloat32(12, true)];
       const norm = values.reduce((sum, v) => sum + v * v, 0);
       if (!values.every(Number.isFinite) || norm < 0.9 || norm > 1.1) {
         throw new BandProtocolError("Invalid band orientation sample");
       }
+      events.push(event({ type: "orientation", timestampUs: timestamp, values }, time));
     }
     return events;
   }

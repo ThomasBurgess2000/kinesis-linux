@@ -51,6 +51,7 @@ class Daemon(QObject):
     dial = Signal(float)
     pairing = Signal("QVariantMap")
     emg = Signal("QVariantMap")
+    motion = Signal("QVariantMap")
     requestFailed = Signal(str)
     showWindowRequested = Signal()
 
@@ -68,6 +69,8 @@ class Daemon(QObject):
         self._buffer = b""
         self._tried_service = False
         self._retry_ms = 500
+        # Pages open that need the band's motion stream; told again after a reconnect.
+        self._viewing = {"readings": False, "cursor": False}
         self._socket = QLocalSocket(self)
         self._socket.connected.connect(self._on_connected)
         self._socket.disconnected.connect(self._on_lost)
@@ -95,6 +98,9 @@ class Daemon(QObject):
         self.call("getState", {}, self._take_state)
         self.call("getConfig", {}, self._take_config)
         self.call("listActions", {}, self._take_catalog)
+        for page, visible in self._viewing.items():
+            if visible:
+                self.call("setViewing", {"page": page, "visible": True})
 
     def _on_lost(self) -> None:
         self._set_link(False)
@@ -159,6 +165,8 @@ class Daemon(QObject):
             self.dial.emit(float(data.get("delta", 0)))
         elif name == "emg":
             self.emg.emit(data)
+        elif name == "motion":
+            self.motion.emit(data)
         elif name == "pairing":
             self._state = {**self._state, "pairing": data}
             self.pairing.emit(data)
@@ -304,6 +312,18 @@ class Daemon(QObject):
     def stopRecording(self) -> None:
         self.call("stopRecording", {}, self._take_state)
 
+    @Slot(bool)
+    def setAirCursor(self, enabled: bool) -> None:
+        self.call("setAirCursor", {"enabled": enabled}, self._take_state)
+
+    @Slot(str, bool)
+    def setViewing(self, page: str, visible: bool) -> None:
+        """The readings or cursor page opened or closed: it needs the band's motion while open."""
+        if self._viewing.get(page) == visible:
+            return
+        self._viewing[page] = visible
+        self.call("setViewing", {"page": page, "visible": visible})
+
     @Slot()
     def openBluetoothSettings(self) -> None:
         subprocess.Popen(["systemsettings", "kcm_bluetooth"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -359,6 +379,10 @@ class Tray:
         self.menu.addSeparator()
         self.step = self.menu.addAction("", daemon.doNextStep)
         self.disconnect = self.menu.addAction("Disconnect", daemon.disconnectBand)
+        # Developer mode, as in the Mac app's menu.
+        self.cursor = self.menu.addAction("Air cursor")
+        self.cursor.setCheckable(True)
+        self.cursor.triggered.connect(daemon.setAirCursor)
         self.menu.addSeparator()
         self.menu.addAction(QIcon.fromTheme("configure"), "Open Kinesis", toggle_window)
         self.menu.addAction(QIcon.fromTheme("application-exit"), "Quit Kinesis", quit_app)
@@ -388,6 +412,10 @@ class Tray:
         self.step.setEnabled(step["enabled"])
         self.step.setVisible(step["id"] != "none")
         self.disconnect.setVisible(bool(state.get("wantsConnection")) if state else False)
+        cursor = controller.get("airCursor") or {}
+        self.cursor.setVisible(bool(state.get("developerMode")) if state else False)
+        self.cursor.setChecked(bool(cursor.get("enabled")))
+        self.cursor.setEnabled(bool(cursor.get("enabled") or cursor.get("available")))
         live = bool(controller.get("live") and controller.get("controlsEnabled"))
         self.icon.setIcon(self.active if live else self.inactive)
         self.icon.setToolTip(f"Kinesis — {status}")
@@ -407,7 +435,10 @@ def check_fixture() -> dict:
                            "handSettingError": None, "lastGesture": "Swipe left", "lastAction": "Sent: Previous desktop",
                            "gestureCount": 12, "dialEngaged": False, "pinchedFinger": None, "error": None,
                            "streamHint": "The sensor stream is quiet. Is the band on your wrist and off the charger?",
-                           "linkCongested": False, "awaitingSystemPairing": False},
+                           "linkCongested": False, "awaitingSystemPairing": False,
+                           "airCursor": {"enabled": False, "available": True, "repositioning": False, "keys": True,
+                                         "skills": [], "error": None},
+                           "motionStreams": {"gyro": True, "orientation": True}},
             "canChangeHand": True, "wantsConnection": True,
             "band": {"address": "AA:BB:CC:DD:EE:FF", "addressType": "public", "name": "Meta Band XXXX"},
             "enrolled": True, "metaUser": "42", "backend": "kde",
@@ -422,7 +453,7 @@ def check_fixture() -> dict:
         "config": {"swipes": {"left": "previousDesktop", "right": "nextDesktop", "up": "overview", "down": "dismiss"},
                    "taps": {"indexTap": "none", "indexDoubleTap": "playPause", "middleTap": "none", "middleDoubleTap": "mute", "middleHold": "none"},
                    "dial": {"target": "volume", "sensitivity": 1}, "setupDone": True, "startAutomatically": True,
-                   "developerMode": True, "rawEMG": True},
+                   "developerMode": True, "rawEMG": True, "cursor": {"speed": 45, "flickBoost": 1.6, "steadiness": 0.5}},
         "catalog": {"actions": [{"id": a, "title": t, "supported": True} for a, t in actions.items()],
                     "swipes": [{"id": d, "title": f"Swipe {d}"} for d in ["left", "right", "up", "down"]],
                     "taps": [{"id": t, "title": title} for t, title in taps.items()],
@@ -466,9 +497,30 @@ def run_check(engine: QQmlApplicationEngine, app: QApplication, daemon: Daemon, 
                 "values": [int(32768 + 400 * math.sin((i * 16 + s) / 40 + c)) for s in range(16) for c in range(8)]}
                for i in range(128)]
     daemon.emg.emit({"restart": True, "batches": batches})
-    for page, name in enumerate(["overview", "gestures", "band", "readings"]):
+    # Three seconds of gyro (a slow wave per axis) and a forearm raised a little.
+    gyro = [[100 + i / 128, 40 * math.sin(i / 60), 20 * math.sin(i / 25 + 1), 10 * math.sin(i / 9)] for i in range(384)]
+    daemon.motion.emit({"restart": True, "gyro": gyro, "aim": {"azimuth": 92.0, "elevation": 12.0}, "armSpeed": 0.6,
+                        "gyroRate": 128, "orientationRate": 128, "delay": 0.012})
+    for page, name in enumerate(["overview", "gestures", "band", "readings", "cursor"]):
         window.setProperty("currentPage", page)
         settle_and_shoot(f"page-{page}-{name}")
+    # The developer pages run long: shoot them whole too.
+    height = window.property("height")
+    window.setProperty("height", 1500)
+    for page, name in [(3, "readings"), (4, "cursor")]:
+        window.setProperty("currentPage", page)
+        settle_and_shoot(f"page-{page}-{name}-full", 0.2)
+    window.setProperty("height", height)
+    window.setProperty("currentPage", 4)
+    # The cursor on, mid-pinch, with the arm turned a little and two skills done.
+    controller = daemon.state["controller"]
+    daemon._take_state({**daemon.state, "controller": {**controller, "pinchedFinger": "index", "airCursor": {
+        **controller["airCursor"], "enabled": True, "skills": ["click", "drag"]}}})
+    for turn in range(20):
+        daemon.motion.emit({"restart": False, "gyro": [], "aim": {"azimuth": 92.0 + turn, "elevation": 12.0 + turn / 2},
+                            "armSpeed": 2.4, "gyroRate": 128, "orientationRate": 128, "delay": 0.012})
+    settle_and_shoot("cursor-on", 0.4)
+    daemon._take_state({**daemon.state, "controller": controller})
     # The overview's hand: a double tap caught mid-motion, then a held pinch turning the dial.
     window.setProperty("currentPage", 0)
     daemon.gesture.emit({"kind": "tap", "key": "tap:indexDoubleTap", "label": "Index double tap",
@@ -543,7 +595,11 @@ def main() -> int:
         return run(args, app, daemon, engine, instance)
     finally:
         # Tear the QML down before the daemon object it binds to; otherwise, as Python frees
-        # `daemon` first at exit, every binding re-runs against null and logs a TypeError.
+        # `daemon` first at exit, every binding re-runs against null and logs a TypeError. Hide the
+        # window first, so handlers that follow its visibility run while QML can still run them.
+        for window in engine.rootObjects():
+            window.hide()
+        app.processEvents()
         shiboken6.delete(engine)
 
 

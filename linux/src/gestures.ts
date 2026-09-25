@@ -34,6 +34,12 @@ export type BandEventPayload =
   | { type: "heartbeat" }
   /// One motion (gyro or orientation) frame, stamped with the band's own clock.
   | { type: "motion"; bandTimeUs: bigint }
+  /// One gyro sample in raw counts (x, y, z).
+  | { type: "gyro"; timestampUs: bigint; values: [number, number, number] }
+  /// One orientation sample: a unit quaternion in wire order w, x, y, z.
+  | { type: "orientation"; timestampUs: bigint; values: [number, number, number, number] }
+  /// The band confirmed (or refused, or never answered) a change of motion streams.
+  | { type: "motionStreams"; streams: MotionStreams; confirmedAfter: number; accepted: boolean }
   /// The band acknowledged the sensor subscription (data may still be on its way).
   | { type: "subscribed" }
   /// The desktop is showing a Bluetooth pairing prompt the person has to accept.
@@ -50,6 +56,19 @@ export type BandEventPayload =
   | { type: "handednessFailure"; message: string }
   | { type: "ceremonyStage"; message: string }
   | { type: "ceremonyHTTP"; request: CeremonyHTTPRequest };
+
+/// Which motion streams the band sends besides gestures. Gyro (6) and orientation (8) stream at
+/// 128 Hz each, most of the link's load, so each can be switched while connected.
+export interface MotionStreams {
+  gyro: boolean;
+  orientation: boolean;
+}
+
+export const ALL_MOTION: MotionStreams = { gyro: true, orientation: true };
+
+export function sameMotion(a: MotionStreams, b: MotionStreams): boolean {
+  return a.gyro === b.gyro && a.orientation === b.orientation;
+}
 
 export interface BandEvent {
   payload: BandEventPayload;

@@ -31,6 +31,30 @@ export interface Config {
   developerMode: boolean;
   /// Live raw sEMG was on (restored when developer mode is on).
   rawEMG: boolean;
+  /// The air cursor's levers (developer mode).
+  cursor: CursorSettings;
+}
+
+export interface CursorSettings {
+  /// Points the pointer moves per degree of arm turn, before acceleration.
+  speed: number;
+  /// How much quick moves speed up: the top acceleration factor.
+  flickBoost: number;
+  /// 0 is the most responsive and 1 the steadiest.
+  steadiness: number;
+}
+
+/// Each cursor lever's range, as the Mac app's sliders allow.
+export const CURSOR_LIMITS: Record<keyof CursorSettings, [number, number]> = {
+  speed: [20, 100],
+  flickBoost: [1, 2.5],
+  steadiness: [0, 1],
+};
+
+export const DEFAULT_CURSOR: CursorSettings = { speed: 45, flickBoost: 1.6, steadiness: 0.5 };
+
+function isCursorSetting(name: string): name is keyof CursorSettings {
+  return Object.hasOwn(CURSOR_LIMITS, name);
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -49,6 +73,7 @@ export const DEFAULT_CONFIG: Config = {
   startAutomatically: true,
   developerMode: false,
   rawEMG: false,
+  cursor: { ...DEFAULT_CURSOR },
 };
 
 export function configPath(): string {
@@ -102,6 +127,13 @@ export function normalize(raw: unknown): Config {
   if (typeof raw.startAutomatically === "boolean") config.startAutomatically = raw.startAutomatically;
   if (typeof raw.developerMode === "boolean") config.developerMode = raw.developerMode;
   if (typeof raw.rawEMG === "boolean") config.rawEMG = raw.rawEMG;
+  if (isRecord(raw.cursor)) {
+    for (const [name, value] of Object.entries(raw.cursor)) {
+      if (!isCursorSetting(name) || typeof value !== "number") continue;
+      const [low, high] = CURSOR_LIMITS[name];
+      if (value >= low && value <= high) config.cursor[name] = value;
+    }
+  }
   return config;
 }
 
@@ -146,6 +178,16 @@ export function applyConfigPatch(config: Config, patch: unknown): Config {
           } else {
             throw new ConfigError(`Unknown setting "dial.${name}"`);
           }
+        }
+        break;
+      }
+      case "cursor": {
+        if (!isRecord(value)) throw new ConfigError("cursor must be an object");
+        for (const [name, v] of Object.entries(value)) {
+          if (!isCursorSetting(name)) throw new ConfigError(`Unknown setting "cursor.${name}"`);
+          const [low, high] = CURSOR_LIMITS[name];
+          if (typeof v !== "number" || !(v >= low && v <= high)) throw new ConfigError(`cursor.${name} must be between ${low} and ${high}`);
+          next.cursor[name] = v;
         }
         break;
       }
@@ -202,7 +244,7 @@ export function settingPatch(key: string, value: string): Record<string, unknown
   let parsed: unknown = value;
   if (group === "commands") {
     try { parsed = JSON.parse(value); } catch { throw new ConfigError("commands.<action> takes a JSON array, e.g. '[\"xdotool\",\"key\",\"Escape\"]'"); }
-  } else if (group === "dial" && name === "sensitivity") {
+  } else if ((group === "dial" && name === "sensitivity") || group === "cursor") {
     parsed = Number(value);
   } else if (group === "configChannel") {
     parsed = value.startsWith("0x") ? parseInt(value, 16) : Number(value);

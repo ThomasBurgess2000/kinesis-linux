@@ -183,3 +183,68 @@ test("readings requested before a reconnect come back on with the subscription",
   expect(has(band.setupEvents, "connected")).toBe(true);
   expect(band.setupEvents.find((e) => e.payload.type === "rawEMGState")?.payload).toEqual({ type: "rawEMGState", enabled: true });
 });
+
+test("gyro and orientation samples come through as events", () => {
+  const session = new BandSession();
+  const band = new SyntheticBand(session);
+  const gyro = band.gyro([100, -200, 300], 5_000_000).find((e) => e.payload.type === "gyro");
+  expect(gyro?.payload).toEqual({ type: "gyro", timestampUs: 5_000_000n, values: [100, -200, 300] });
+  const quaternion = band.orientation([1, 0, 0, 0], 5_010_000).find((e) => e.payload.type === "orientation");
+  expect(quaternion?.payload).toEqual({ type: "orientation", timestampUs: 5_010_000n, values: [1, 0, 0, 0] });
+});
+
+test("motion streams switch while connected, one change at a time, and restart on request", () => {
+  const session = new BandSession({ motion: { gyro: true, orientation: false } });
+  const band = new SyntheticBand(session);
+  const subscribe = band.setupEvents;
+  expect(has(subscribe, "connected")).toBe(true);
+  expect(session.motionStreams).toEqual({ gyro: true, orientation: false });
+
+  // Orientation on. A second change waits for the first to be answered.
+  const request = session.setMotionStreams({ gyro: true, orientation: true }, 100);
+  expect(session.setMotionStreams({ gyro: true, orientation: false }, 100).length).toBe(0);
+  const answered = band.deliver(request);
+  // Every stream field is set explicitly (this is the second change, orientation off again).
+  const control = band.lastControl!;
+  expect([3, 6, 8].map((f) => control.integer(f))).toEqual([1n, 1n, 0n]);
+  expect(control.contains(2)).toBe(false);
+  const changes = answered.filter((e) => e.payload.type === "motionStreams").map((e) => e.payload);
+  // The first is confirmed; the waiting one goes out with it and is confirmed in turn.
+  expect(changes).toMatchObject([
+    { streams: { gyro: true, orientation: true }, accepted: true },
+    { streams: { gyro: true, orientation: false }, accepted: true },
+  ]);
+  expect(session.motionStreams).toEqual({ gyro: true, orientation: false });
+
+  // A restart turns motion off, then back to what it was. Here the change before it is never
+  // answered, so the restart waits, and the unanswered change is given up after 8 s.
+  band.muteStreams = true;
+  band.deliver(session.setMotionStreams({ gyro: true, orientation: true }, 101));
+  expect(session.restartMotionStreams(102).length).toBe(0);
+  expect(session.tick(110).find((e) => e.payload.type === "motionStreams")?.payload).toMatchObject({ accepted: false });
+  band.muteStreams = false;
+  // An earlier change failing leaves the restart waiting: the connection's tick sends it.
+  const off = session.flushMotion(111);
+  const restored = band.deliver(off).filter((e) => e.payload.type === "motionStreams").map((e) => e.payload);
+  expect(restored).toMatchObject([{ streams: { gyro: false, orientation: false } }, { streams: { gyro: true, orientation: true } }]);
+  expect(session.streamsEnabled).toBe(true);
+});
+
+test("a refused motion change leaves the streams as they were", () => {
+  const session = new BandSession();
+  const band = new SyntheticBand(session);
+  band.refuseMotion = true;
+  const events = band.deliver(session.setMotionStreams({ gyro: true, orientation: false }, 100));
+  expect(events.find((e) => e.payload.type === "motionStreams")?.payload).toMatchObject({
+    streams: { gyro: true, orientation: true }, accepted: false,
+  });
+  expect(session.motionStreams).toEqual({ gyro: true, orientation: true });
+});
+
+test("streams asked for before the subscription are what it subscribes to", () => {
+  const session = new BandSession();
+  expect(session.setMotionStreams({ gyro: true, orientation: false }, 0).length).toBe(0);
+  const band = new SyntheticBand(session);
+  expect(has(band.setupEvents, "connected")).toBe(true);
+  expect(session.motionStreams).toEqual({ gyro: true, orientation: false });
+});
