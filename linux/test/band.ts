@@ -141,6 +141,13 @@ export class SyntheticBand {
     }
     // Our reply to the band proof (0x03001000 on channel 2): nothing to send.
     if (kind === 0x03001000) return [];
+    // BatteryInfoReq (channel 0x8008): 76%, charging, as BatteryInfoResp → batteryData.
+    if (frame.channel === 0x8008) {
+      const id = new ProtoFields(frame.payload).integer(1);
+      const battery = concat(BandWire.field(1, 76), BandWire.field(2, 1));
+      return [this.encrypt(BandWire.frame(8, [0x02000315], concat(BandWire.field(1, id), BandWire.field(2, 1),
+        BandWire.field(3, BandWire.field(1, battery)))))];
+    }
     // Device-info query (channel 0x8003): reply success on channel 3.
     if (frame.channel === 0x8003) {
       return [this.encrypt(BandWire.frame(3, [0x02000315], concat(BandWire.field(1, 1), BandWire.field(2, 1))))];

@@ -77,6 +77,7 @@ export class BandConnection {
   private lastReadAt = 0;
   private lastStatusQuery = 0;
   private nextBatteryRead = 0;
+  private nextBatteryStatusRead = 0;
   private batteryBusy = false;
   private stopping = false;
   private disconnecting = false;
@@ -320,6 +321,10 @@ export class BandConnection {
   private emit(event: BandEvent): void {
     if (this.disconnecting || this.stopping) return;
     if (event.payload.type === "handedness") this.log.notice(`Band hand confirmed: ${event.payload.hand}`);
+    if (event.payload.type === "batteryStatus") {
+      const status = event.payload.status;
+      this.log.info(status ? `Battery status: ${status.level}%, charging ${status.charging ?? "unknown"}` : "Battery status unavailable");
+    }
     this.onEvent?.(event);
   }
 
@@ -352,6 +357,16 @@ export class BandConnection {
     const session = this.session;
     if (!this.stopping && session) {
       for (const event of session.tick(time)) this.emit(event);
+      // Upstream polls BatteryInfoReq every 5 s while streaming; it is also regular host traffic.
+      if (session.streamsEnabled && time >= this.nextBatteryStatusRead) {
+        this.nextBatteryStatusRead = time + 5;
+        try {
+          const query = session.queryBatteryStatus(time);
+          if (query.length) this.channel?.write(query);
+        } catch (error) {
+          this.fail(error);
+        }
+      }
       // Optional keepalive: some firmware drops the link after ~35 s of one-way streaming. A
       // periodic status query while data still flows tests whether the band wants to hear from us.
       const keepalive = Number(process.env.KINESIS_KEEPALIVE ?? 0);

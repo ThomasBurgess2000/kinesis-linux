@@ -25,6 +25,8 @@ export interface BandGesture {
 export type BandEventPayload =
   | { type: "devices"; devices: BandDevice[] }
   | { type: "battery"; percent: number }
+  /// In-band BatteryInfoResp; undefined when the band didn't answer or doesn't support it.
+  | { type: "batteryStatus"; status: { level: number; charging: boolean | undefined } | undefined }
   | { type: "preparing" }
   | { type: "connected" }
   | { type: "disconnected" }

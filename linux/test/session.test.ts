@@ -105,6 +105,25 @@ test("enrollment claims the band, then trusts the proof the band sends on its al
   expect(hex(session.enrolledIdentity!.privateKey.publicPoint)).toBe(hex(ceremony.appPublicKey));
 });
 
+test("only one battery query is outstanding at a time", () => {
+  const session = new BandSession();
+  new SyntheticBand(session);
+  expect(session.queryBatteryStatus(100).length).toBeGreaterThan(0);
+  expect(session.queryBatteryStatus(100).length).toBe(0);
+});
+
+test("a battery reply resolves the pending request; an unanswered one times out", () => {
+  const session = new BandSession();
+  const band = new SyntheticBand(session);
+  const answered = band.deliver(session.queryBatteryStatus(100));
+  const status = answered.find((e) => e.payload.type === "batteryStatus");
+  expect(status?.payload).toEqual({ type: "batteryStatus", status: { level: 76, charging: true } });
+
+  session.queryBatteryStatus(200); // never delivered to the band
+  expect(session.tick(202).some((e) => e.payload.type === "batteryStatus")).toBe(false);
+  expect(session.tick(203.5).find((e) => e.payload.type === "batteryStatus")?.payload).toEqual({ type: "batteryStatus", status: undefined });
+});
+
 test("the declared parameter set follows the band's offer", () => {
   expect(BandSession.declareParams(3n)).toBe(3n);
   expect(BandSession.declareParams(27n)).toBe(26n);

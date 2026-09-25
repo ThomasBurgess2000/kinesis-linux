@@ -36,6 +36,27 @@ function sameChannel(a: number, b: number): boolean {
   return (a & 0xff) === (b & 0xff);
 }
 
+/// BatteryInfoResp: status 1 in field 2, then response (3) → batteryData (1) with level (1) and an
+/// optional charging flag (2). Port of BandBatteryStatus.swift; undefined when anything is off.
+export function parseBatteryStatus(payload: Uint8Array): { level: number; charging: boolean | undefined } | undefined {
+  try {
+    const rpc = new ProtoFields(payload);
+    if (rpc.requiredInteger(2) !== 1n) return undefined;
+    const battery = new ProtoFields(new ProtoFields(rpc.bytes(3)).bytes(1));
+    const level = battery.requiredInteger(1);
+    if (level > 100n) return undefined;
+    let charging: boolean | undefined;
+    if (battery.contains(2)) {
+      const flag = battery.requiredInteger(2);
+      if (flag > 1n) return undefined;
+      charging = flag === 1n;
+    }
+    return { level: Number(level), charging };
+  } catch {
+    return undefined;
+  }
+}
+
 const FINGERS = ["unknown", "thumb", "index", "middle", "notApplicable"];
 const ACTIONS = ["unknown", "press", "release", "tap", "doubletap", "click", "up", "down", "left", "right", "wake",
   "swipeIn", "swipeOut", "ia", "partialPress", "partialRelease", "partialClick", "partialUp", "partialDown",
@@ -91,6 +112,11 @@ export class BandSession {
   enrolledIdentity: BandEnrollmentIdentity | undefined;
   private configurationID = 0n;
   private handRequest: HandRequest | undefined;
+  private readonly batteryChannel = 0x8008;
+  private batteryChannelOpened = false;
+  private batteryRequestID = 0n;
+  private batteryRequest: { id: bigint; deadline: number } | undefined;
+  private batteryUnavailable = false;
   hand: BandHand | undefined;
 
   onFrame: ((frame: { channel: number; words: number[]; length: number }) => void) | undefined;
@@ -215,7 +241,23 @@ export class BandSession {
       this.hand = undefined;
       events.push(event({ type: "handednessFailure", message: "Couldn't confirm the band hand. Reconnect and try again." }, time));
     }
+    if (this.batteryRequest && time >= this.batteryRequest.deadline && !this.stopping) {
+      this.batteryRequest = undefined;
+      events.push(event({ type: "batteryStatus", status: undefined }, time));
+    }
     return events;
+  }
+
+  /// BatteryInfoReq: an empty read on its own service channel, separate from the sensor
+  /// subscription. Empty when streams aren't up, a request is pending, or the band lacks it.
+  queryBatteryStatus(time: number): Uint8Array {
+    if (!this.streamsEnabled || this.stopping || this.batteryUnavailable || this.batteryRequest) return new Uint8Array();
+    this.batteryRequestID += 1n;
+    this.batteryRequest = { id: this.batteryRequestID, deadline: time + 3 };
+    const words = this.batteryChannelOpened ? [] : [0x8100ce56, 0x02000314];
+    this.batteryChannelOpened = true;
+    return this.encrypt(BandWire.frame(this.batteryChannel, words,
+      concat(BandWire.field(1, this.batteryRequestID), BandWire.field(2, new Uint8Array()))));
   }
 
   setHandedness(hand: BandHand, time: number): Uint8Array {
@@ -449,6 +491,25 @@ export class BandSession {
       this.setupStage = "deviceInfo";
       outgoing.push(this.encrypt(BandWire.frame(0x8003, [0x8100ce56, 0x02000314], concat(
         BandWire.field(1, 1), BandWire.field(3, new Uint8Array())))));
+      return [];
+    }
+    if (sameChannel(frame.channel, this.batteryChannel) && !this.stopping) {
+      if (kind === 0x0300c001) {
+        this.batteryRequest = undefined;
+        this.batteryUnavailable = true;
+        return [event({ type: "batteryStatus", status: undefined }, time)];
+      }
+      const request = this.batteryRequest;
+      if (kind === 0x02000315 && request) {
+        // Optional status: a malformed answer must not interrupt gestures.
+        try {
+          if (new ProtoFields(frame.payload).requiredInteger(1) !== request.id) return [];
+        } catch {
+          return [];
+        }
+        this.batteryRequest = undefined;
+        return [event({ type: "batteryStatus", status: parseBatteryStatus(frame.payload) }, time)];
+      }
       return [];
     }
     if (kind === 0x0300c001 && !this.stopping) {
