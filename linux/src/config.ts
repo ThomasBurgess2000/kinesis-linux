@@ -34,7 +34,7 @@ export const DEFAULT_CONFIG: Config = {
   security: "low",
   linkSetup: "pipelined",
   configChannel: 0x8006,
-  bond: true, // the band drops unbonded links ~30 s in
+  bond: false, // not needed: the ~37 s stalls were the kernel credit-ident bug (see kernel-fix/)
   directL2cap: true,
   psm: 255,
 };

@@ -99,7 +99,11 @@ export class BandSession {
   /// The parameters we declare in our EnableEncryption (field 5). Each side sends with the set it
   /// declared, so this keys our TX while the band's declared set (negotiatedParams) keys RX.
   declaredParams = 3n;
-  private readonly streamFields = [3, 6, 8];
+  /// Subscribed streams: 3 gestures, 6 gyro, 8 quaternion. KINESIS_STREAMS (e.g. "3") narrows it
+  /// for experiments; the pinch dial needs gyro.
+  private readonly streamFields = process.env.KINESIS_STREAMS
+    ? process.env.KINESIS_STREAMS.split(",").map(Number).filter((f) => [2, 3, 6, 8].includes(f))
+    : [3, 6, 8];
   private readonly streamChannel = 0x8005;
   private readonly configurationChannel: number;
   private setupStage: SetupStage = "link";

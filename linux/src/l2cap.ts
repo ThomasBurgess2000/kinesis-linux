@@ -116,7 +116,8 @@ export function openL2cap(options: L2capOptions, wakeFd?: number, timeoutMs = op
     }
     // LE CoC credits are returned to the peer only as this socket drains; a bigger receive buffer
     // keeps credits flowing across scheduling hiccups. The kernel clamps this to net.core.rmem_max.
-    const rcvbuf = new Int32Array([options.receiveBuffer ?? 4 * 1024 * 1024]);
+    // KINESIS_RCVBUF overrides it for flow-control experiments.
+    const rcvbuf = new Int32Array([Number(process.env.KINESIS_RCVBUF ?? 0) || (options.receiveBuffer ?? 4 * 1024 * 1024)]);
     if (libc.symbols.setsockopt(fd, SOL_SOCKET, SO_RCVBUF, ptr(rcvbuf), 4) < 0) {
       options.log?.(`SO_RCVBUF rejected: ${errnoMessage()}`);
     }
