@@ -1,113 +1,112 @@
-# kinesis for linux
+# Kinesis for Linux
 
 <img width="1006" height="749" alt="Screenshot_20260925_184016" src="https://github.com/user-attachments/assets/6a8c081d-a97d-4316-8227-6ef0132d525e" />
 
+Use your Meta Neural Band to control a Linux desktop: swipe between desktops, open the overview,
+control your music, pinch and turn for volume or brightness, and (experimentally) move the pointer
+with your forearm. It's a tray icon and a Kirigami window for KDE Plasma, with the band in a
+background service.
 
-use your meta neural band to control a linux desktop: swipe between desktops, open the overview,
-control your music, pinch + turn for volume or brightness, and (experimentally) move the pointer
-with your forearm. a tray icon and a kirigami window for kde plasma, with the band in a background
-service.
-
-this is a linux port of [callbacked/kinesis](https://github.com/callbacked/kinesis), the macos app,
-which grew out of [neural-band-poc](https://github.com/callbacked/neural-band-poc). it speaks the same
-protocol with the same gesture rules, rewritten for bun and bluez. the mac app's sources are still here
-(`Sources/`, `Packaging/`, `scripts/`), kept in step with upstream; the linux port lives in
+This is a Linux port of [callbacked/kinesis](https://github.com/callbacked/kinesis), the macOS app,
+which grew out of [neural-band-poc](https://github.com/callbacked/neural-band-poc). It speaks the same
+protocol with the same gesture rules, rewritten for Bun and BlueZ. The Mac app's sources are still
+here (`Sources/`, `Packaging/`, `scripts/`), kept in step with upstream; the Linux port lives in
 [`linux/`](linux/).
 
-everything is experimental. some things may act quirky or not work at all.
+Everything is experimental. Some things may act quirky or not work at all.
 
-- **transport**: bluez over d-bus (`busctl`) for discovery, the psm characteristic, pairing, and battery; a raw le l2cap socket for the encrypted input stream. no root. linux kernels before 7.2 need one bluetooth patch for sessions longer than ~40 s (see [kernel](#kernel)).
-- **crypto**: the airshield handshake and packet authentication are a direct port of `Sources/KinesisCore`, checked against the same test vectors and synthetic-peer tests.
-- **actions**: on kde plasma, global shortcuts are invoked over d-bus, which works on wayland without input injection. escape and tab switching go through `ydotool`. any action can be replaced with your own command, so other desktops work too.
+- **Transport**: BlueZ over D-Bus (`busctl`) for discovery, the PSM characteristic, pairing, and battery; a raw LE L2CAP socket for the encrypted input stream. No root. Linux kernels before 7.2 need one Bluetooth patch for sessions longer than about 40 s (see [Kernel](#kernel)).
+- **Crypto**: the AirShield handshake and packet authentication are a direct port of `Sources/KinesisCore`, checked against the same test vectors and synthetic-peer tests.
+- **Actions**: on KDE Plasma, global shortcuts are invoked over D-Bus, which works on Wayland without input injection. Escape and tab switching go through `ydotool`. Any action can be replaced with your own command, so other desktops work too.
 
-## requirements
+## Requirements
 
-- linux with bluez 5.5x+ (`bluetoothd` running) and a bluetooth le adapter
-- bun 1.2+
-- for the built-in kde backend: plasma 6 with `qdbus6` (package `qt6-tools` or `qdbus-qt6`); optionally `ydotool` with `ydotoold` running for the escape and tab actions
-- for other desktops: `xdotool`, `ydotool`, `wtype`, or any command you want to map
-- for the app (tray icon + window): pyside6 with its qml modules, and kirigami + kirigami addons (installed with plasma):
+- Linux with BlueZ 5.5x or later (`bluetoothd` running) and a Bluetooth LE adapter
+- Bun 1.2 or later
+- For the built-in KDE backend: Plasma 6 with `qdbus6` (package `qt6-tools` or `qdbus-qt6`); optionally `ydotool` with `ydotoold` running for the Escape and tab actions
+- For other desktops: `xdotool`, `ydotool`, `wtype`, or any command you want to map
+- For the app (tray icon and window): PySide6 with its QML modules, and Kirigami and Kirigami Addons (installed with Plasma):
   `sudo apt install python3-pyside6.qtqml python3-pyside6.qtquick python3-pyside6.qtnetwork qml6-module-qtquick3d`
-- for the air cursor: membership of the `input` group (see [air cursor](#air-cursor))
+- For the air cursor: membership of the `input` group (see [Air cursor](#air-cursor))
 
-## the app
+## The app
 
-a tray icon and a kirigami window, like the mac app's menu bar and main window. the band lives in a
+A tray icon and a Kirigami window, like the Mac app's menu bar and main window. The band lives in a
 background service (`kinesis daemon`, the `kinesis.service` user unit); the window only draws it, so
 closing or restarting the window never drops the band.
 
 ```sh
 cd linux
 bun install
-packaging/install.sh              # user unit + launcher + login autostart, then opens kinesis
+packaging/install.sh              # user unit, launcher, and login autostart, then opens Kinesis
 packaging/install.sh --uninstall  # removes them again (pairing and settings are kept)
 ```
 
-**unpair the band from the meta ai app first.** first launch runs a quick setup: pair the band (put
-it in pairing mode, sign in with meta once, claim the band), pick your wrist, try a swipe, try pinch +
-turn on a practice dial, then a summary with a test action. after that the window has:
+**Unpair the band from the Meta AI app first.** The first launch runs a quick setup: pair the band
+(put it in pairing mode, sign in with Meta once, claim the band), pick your wrist, try a swipe, try
+pinch and turn on a practice dial, then a summary with a test action. After that the window has:
 
-- **band column**: status, battery, gesture count, and the one next step (pair, connect, enable or pause controls)
-- **overview**: a 3d hand that mirrors the band (it lights the fingertips of each gesture, acts it out, holds a pinch as long as you do, and turns with your wrist on the dial, inside the band's ring of electrodes), what the gesture did, and your assignments
-- **gestures**: an action for each swipe and tap, and the pinch dial's target and sensitivity. changes apply immediately
-- **band**: wrist, start automatically, start at login, meta account, diagnostics with a test action, forget this band, and developer mode
-- **readings** (developer mode): live raw semg on all eight channels, raw recording as jsonl, and the band's motion: gyro traces, where the forearm points, sample rates, and arrival delay
-- **cursor** (developer mode): the experimental [air cursor](#air-cursor)
+- **Band column**: status, battery, gesture count, and the one next step (pair, connect, enable or pause controls)
+- **Overview**: a 3D hand that mirrors the band (it lights the fingertips of each gesture, acts it out, holds a pinch as long as you do, and turns with your wrist on the dial, inside the band's ring of electrodes), what the gesture did, and your assignments
+- **Gestures**: an action for each swipe and tap, and the pinch dial's target and sensitivity. Changes apply immediately
+- **Band**: wrist, start automatically, start at login, Meta account, diagnostics with a test action, forget this band, and developer mode
+- **Readings** (developer mode): live raw sEMG on all eight channels, raw recording as JSONL, and the band's motion: gyro traces, where the forearm points, sample rates, and arrival delay
+- **Cursor** (developer mode): the experimental [air cursor](#air-cursor)
 
-the tray menu has the status, battery, the next step, disconnect, the air cursor (developer mode),
-open, and quit. closing the window keeps kinesis in the tray; **quit** stops the service too, which
-disconnects the band. the command line still works for scripting; `run`, `hand` and `enroll` refuse
+The tray menu has the status, battery, the next step, disconnect, the air cursor (developer mode),
+open, and quit. Closing the window keeps Kinesis in the tray; **Quit** stops the service too, which
+disconnects the band. The command line still works for scripting; `run`, `hand` and `enroll` refuse
 while the service holds the band (`systemctl --user stop kinesis.service` first).
 
 `python3 linux/ui/kinesis-ui.py --check [--screenshots DIR]` renders every page and setup step
-offscreen against canned data and fails on any qml warning (no band or service needed).
+offscreen against canned data and fails on any QML warning (no band or service needed).
 
-the service speaks newline-delimited json on `$XDG_RUNTIME_DIR/kinesis/daemon.sock` (0600): requests
-`{id, method, params}`, replies `{id, result|error}`, and pushed `{event, data}` for state, config,
-gesture, action, dial, pairing, log, emg, and motion. see `linux/src/daemon.ts`.
+The service speaks newline-delimited JSON on `$XDG_RUNTIME_DIR/kinesis/daemon.sock` (mode 0600):
+requests `{id, method, params}`, replies `{id, result|error}`, and pushed `{event, data}` for state,
+config, gesture, action, dial, pairing, log, emg, and motion. See `linux/src/daemon.ts`.
 
-## command line
+## Command line
 
 ```sh
 cd linux
 bun install
-bun run src/cli.ts doctor      # checks bluetooth, tools, permissions, and the kernel patch
+bun run src/cli.ts doctor      # checks Bluetooth, tools, permissions, and the kernel patch
 bun run src/cli.ts scan        # finds the band and remembers it
-bun run src/cli.ts enroll      # claims the band to your meta account (once)
+bun run src/cli.ts enroll      # claims the band to your Meta account (once)
 bun run src/cli.ts run         # connects, enables controls, and reconnects if the link drops
 ```
 
 `run --practice` connects and prints gestures without sending anything to the desktop. `run --verbose`
-logs the bluetooth steps. ctrl-c disables the band's streams cleanly before exiting. to install as a
-command: `bun link` in `linux/`, then `kinesis run`.
+logs the Bluetooth steps. Ctrl-C disables the band's streams cleanly before exiting. To install it as
+a command, run `bun link` in `linux/`, then `kinesis run`.
 
-## enrollment
+## Enrollment
 
-the band gates its sensor stream to whichever key it was enrolled with (`0xc001` without it).
-`kinesis enroll` (or pairing in the app) claims the band to your meta account and stores a signing
-key locally, so every later session proves ownership with a per-session trust handshake — the same
-thing the phone app does. you sign in on meta's own page in your browser; a temporary handler for the
-`oculus://` / `fb-viewapp://` callback captures the result (the cli falls back to pasting it). this
-client never sees your password, only the returned blob. the key lives in
-`~/.local/state/kinesis/identity/` and the meta session in `~/.local/state/kinesis/meta-session.json`.
-see [linux/docs/findings.md](linux/docs/findings.md) for how the protocol was worked out.
+The band gates its sensor stream to whichever key it was enrolled with (`0xc001` without it).
+`kinesis enroll` (or pairing in the app) claims the band to your Meta account and stores a signing
+key locally, so every later session proves ownership with a per-session trust handshake, the same
+thing the phone app does. You sign in on Meta's own page in your browser; a temporary handler for the
+`oculus://` and `fb-viewapp://` callbacks captures the result (the CLI falls back to pasting it). This
+client never sees your password, only the returned blob. The key lives in
+`~/.local/state/kinesis/identity/` and the Meta session in `~/.local/state/kinesis/meta-session.json`.
+See [linux/docs/findings.md](linux/docs/findings.md) for how the protocol was worked out.
 
-## controls
+## Controls
 
-the initial mappings match the mac app:
+The initial mappings match the Mac app:
 
-| gesture | action |
+| Gesture | Action |
 | --- | --- |
-| thumb swipe left / right | previous / next desktop |
-| thumb swipe up | overview |
-| thumb swipe down | dismiss (escape) |
-| index double tap | play / pause |
-| middle double tap | mute / unmute |
-| middle hold | unassigned |
-| index or middle single tap | unassigned |
-| pinch thumb + index, then turn your wrist | volume |
+| Thumb swipe left / right | Previous / next desktop |
+| Thumb swipe up | Overview |
+| Thumb swipe down | Dismiss (Escape) |
+| Index double tap | Play / pause |
+| Middle double tap | Mute / unmute |
+| Middle hold | Unassigned |
+| Index or middle single tap | Unassigned |
+| Pinch thumb and index, then turn your wrist | Volume |
 
-change them in the app's gestures page, or with `kinesis config`:
+Change them on the app's Gestures page, or with `kinesis config`:
 
 ```sh
 kinesis actions                                  # every action and whether your backend supports it
@@ -118,11 +117,11 @@ kinesis config set dial.sensitivity 2
 kinesis actions --test nextDesktop               # try one without the band
 ```
 
-actions: `previousDesktop`, `nextDesktop`, `overview`, `showDesktop`, `dismiss`, `previousWindow`, `nextWindow`, `previousTab`, `nextTab`, `playPause`, `nextTrack`, `previousTrack`, `mute`, `volumeUp`, `volumeDown`, `brightnessUp`, `brightnessDown`, `launcher`, `none`.
+Actions: `previousDesktop`, `nextDesktop`, `overview`, `showDesktop`, `dismiss`, `previousWindow`, `nextWindow`, `previousTab`, `nextTab`, `playPause`, `nextTrack`, `previousTrack`, `mute`, `volumeUp`, `volumeDown`, `brightnessUp`, `brightnessDown`, `launcher`, `none`.
 
-### other desktops
+### Other desktops
 
-set `backend` to `command` and map actions to argv arrays. overrides also work alongside the kde backend for individual actions.
+Set `backend` to `command` and map actions to argv arrays. Overrides also work alongside the KDE backend for individual actions.
 
 ```sh
 kinesis config set backend command
@@ -131,68 +130,68 @@ kinesis config set commands.volumeUp '["wpctl","set-volume","@DEFAULT_AUDIO_SINK
 kinesis config set commands.playPause '["playerctl","play-pause"]'
 ```
 
-settings live in `~/.config/kinesis/config.json` (`kinesis config path`).
+Settings live in `~/.config/kinesis/config.json` (`kinesis config path`).
 
-## air cursor
+## Air cursor
 
-experimental, as on the mac: turn on developer mode (band page), then the cursor page or the tray.
-move your forearm to move the pointer, like a mouse. pinch your index to click, hold the pinch to
-drag, pinch your middle finger to right-click. thumb swipes keep their actions. escape turns it off;
-hold alt to move your arm without moving the pointer.
+Experimental, as on the Mac: turn on developer mode (Band page), then use the Cursor page or the tray.
+Move your forearm to move the pointer, like a mouse. Pinch your index finger to click, hold the pinch
+to drag, and pinch your middle finger to right-click. Thumb swipes keep their actions. Escape turns
+it off; hold Alt to move your arm without moving the pointer.
 
-it's a port of upstream's pointer model (`linux/src/air-cursor.ts`, from `AirCursor.swift` and its
-[notes](docs/cursor-orientation.md)): the band's orientation quaternion says where the forearm points
-and the gyro how fast it turns; a wrist twist never moves the pointer; a 1€ filter and a stillness
-threshold hold it still when your arm is; slow aiming gets 0.6× and flicks up to the flick boost; a
-pinch's drift is absorbed; movement plays back 30 ms behind the arm so it's smooth; and a gentle pull
-toward where the arm started keeps pointer and arm from walking apart. the three levers on the cursor
-page are speed (points per degree), flick boost, and steadiness, also `kinesis config set
-cursor.speed 50` and friends.
+It's a port of upstream's pointer model (`linux/src/air-cursor.ts`, from `AirCursor.swift` and its
+[notes](docs/cursor-orientation.md)). The band's orientation quaternion says where the forearm points
+and the gyro how fast it turns, so a wrist twist never moves the pointer. A 1€ filter and a
+stillness threshold hold the pointer still when your arm is. Slow aiming gets 0.6× and flicks up to
+the flick boost. A pinch's drift is absorbed. Movement plays back 30 ms behind the arm so it's
+smooth, and a gentle pull toward where the arm started keeps pointer and arm from walking apart. The
+three levers on the Cursor page are speed (points per degree), flick boost, and steadiness; they're
+also settable with `kinesis config set cursor.speed 50` and so on.
 
-on linux the pointer is a virtual mouse the service makes with uinput, set to a flat acceleration
-profile through kwin, so clicks land wherever the pointer is. escape and alt are read from your
-keyboards' evdev nodes (passively, only those keys, only while the cursor is on), since wayland has
-no global key monitor. both need the `input` group:
+On Linux the pointer is a virtual mouse the service makes with uinput, set to a flat acceleration
+profile through KWin, so clicks land wherever the pointer is. Escape and Alt are read from your
+keyboards' evdev nodes (passively, only those keys, only while the cursor is on), since Wayland has
+no global key monitor. Both need the `input` group:
 
 ```sh
 sudo usermod -aG input $USER    # then log out and back in
 ```
 
-`kinesis doctor` shows whether both work. the orientation stream only runs while the cursor, the
-readings page, or the cursor page needs it; upstream found the link congested with it always on.
+`kinesis doctor` shows whether both work. The orientation stream only runs while the cursor, the
+Readings page, or the Cursor page needs it; upstream found the link congested with it always on.
 `KINESIS_MOTION_LOG=/path/motion.jsonl` makes the service log every gyro, orientation, and gesture
-event with both clocks. upstream's calibration and practice lab are lab-build tools and aren't ported.
+event with both clocks. Upstream's calibration and practice lab are lab-build tools and aren't ported.
 
-## handedness
+## Handedness
 
-the band's own hand setting is read on every connect and the wrist dial is mirrored for the left
-hand, as in the mac app. change it in the app, or on the band with `kinesis hand left`.
+The band's own hand setting is read on every connect, and the wrist dial is mirrored for the left
+hand, as in the Mac app. Change it in the app, or on the band with `kinesis hand left`.
 
-## pairing and reconnecting
+## Pairing and reconnecting
 
-the service connects through bluez. the first connection after pairing mode asks to pair: plasma
-shows a bluetooth pairing request, and the band only opens its input channel once it's accepted.
-`kinesis forget` drops the saved band and removes it from bluez.
+The service connects through BlueZ. The first connection after pairing mode asks to pair: Plasma
+shows a Bluetooth pairing request, and the band only opens its input channel once it's accepted.
+`kinesis forget` drops the saved band and removes it from BlueZ.
 
-**known issue: reconnecting to an already-paired band can be slow.** after a restart, a resume, or a
-dropped link, bluez's connect to the bonded band can time out again and again for several minutes
-before one gets through. the dependable way back in is to remove the bond and pair fresh:
+**Known issue: reconnecting to an already-paired band can be slow.** After a restart, a resume, or a
+dropped link, BlueZ's connect to the bonded band can time out again and again for several minutes
+before one gets through. The dependable way back in is to remove the bond and pair fresh:
 
 ```sh
 bluetoothctl remove <band address>    # the address is in `kinesis doctor`
 ```
 
-then press the band's button and accept the pairing request. the direct l2cap connect
-(`kinesis config set directL2cap true`) skips bluez's connect, but current firmware refuses it from
+Then press the band's button and accept the pairing request. The direct L2CAP connect
+(`kinesis config set directL2cap true`) skips BlueZ's connect, but current firmware refuses it from
 an unbonded host.
 
-## kernel
+## Kernel
 
-linux kernels before 7.2 leak an l2cap signaling ident on every le credit packet. after 254 credit
-packets they're sent with the invalid ident 0, the band ignores them, and the stream stops — about
-37 s into a full-rate session, sooner with a smaller socket buffer. `dmesg` shows `Bluetooth: Unable to
-allocate ident: -28`. it's fixed upstream in
-[6e1930ece855](https://github.com/torvalds/linux/commit/6e1930ece855); until your distribution ships
+Linux kernels before 7.2 leak an L2CAP signaling ident on every LE credit packet. After 254 credit
+packets they're sent with the invalid ident 0, the band ignores them, and the stream stops, about
+37 s into a full-rate session (sooner with a smaller socket buffer). `dmesg` shows `Bluetooth: Unable
+to allocate ident: -28`. It's fixed upstream in
+[6e1930ece855](https://github.com/torvalds/linux/commit/6e1930ece855). Until your distribution ships
 it, [`linux/kernel-fix/`](linux/kernel-fix/) builds a patched `bluetooth.ko` for your running kernel
 and swaps it in without a reboot:
 
@@ -203,40 +202,40 @@ sudo kernel-fix/install.sh             # installs to /lib/modules/<release>/upda
 sudo kernel-fix/uninstall.sh           # back to the stock module
 ```
 
-re-run both after a kernel update. `kinesis doctor` (and diagnostics in the app) report whether the
+Re-run both after a kernel update. `kinesis doctor` (and diagnostics in the app) report whether the
 patched module is loaded.
 
-## how it works
+## How it works
 
-everything below is under `linux/`.
+Everything below is under `linux/`.
 
-- `src/wire.ts`, `src/airshield.ts`, `src/session.ts`, `src/dial.ts`, `src/gestures.ts` — the protocol and gesture core, ported one to one from the swift sources. transport agnostic.
-- `src/ceremony.ts`, `src/identity.ts`, `src/meta-auth.ts`, `src/meta-pair.ts`, `src/enroll.ts` — band enrollment: the ownership ceremony, the persistent p-256 signing identity, the meta account sign-in, and the hardware-graph pairing calls.
-- `src/bluez.ts` + `src/dbus-text.ts` — bluez through `busctl`, parsing its typed text output (busctl's json mode can't serialise the `a{qv}` manufacturer data that phones advertise).
-- `src/l2cap.ts` + `src/l2cap-worker.ts` — `AF_BLUETOOTH` seqpacket socket through `bun:ffi`. reads block in a worker thread and are posted to the main thread; writes go straight to the descriptor.
-- `src/connection.ts` — one band connection: bluez connect, psm read, l2cap open, handshake, subscription, status queries when quiet, clean shutdown with the disable acknowledgement.
-- `src/controller.ts` — the mac app's model without the ui: gating, de-duplication, dial steps, the air cursor, late-data handling, reconnect with backoff.
-- `src/air-cursor.ts`, `src/uinput.ts`, `src/keys.ts`, `src/motion.ts` — the air cursor's pointer model, its virtual mouse, escape and alt, and motion readings.
-- `src/daemon.ts` — the background service and its socket api. `src/actions.ts` — kde and command backends.
-- `ui/` — the pyside6 launcher and tray (`kinesis-ui.py`) and the kirigami window (`ui/qml/`), including the qt quick 3d hand (`ui/hand/`).
-- `kernel-fix/` — the patched bluetooth module. `packaging/` — the user unit, launcher, and autostart entry.
+- `src/wire.ts`, `src/airshield.ts`, `src/session.ts`, `src/dial.ts`, `src/gestures.ts`: the protocol and gesture core, ported one to one from the Swift sources. Transport agnostic.
+- `src/ceremony.ts`, `src/identity.ts`, `src/meta-auth.ts`, `src/meta-pair.ts`, `src/enroll.ts`: band enrollment, meaning the ownership ceremony, the persistent P-256 signing identity, the Meta account sign-in, and the hardware-graph pairing calls.
+- `src/bluez.ts` and `src/dbus-text.ts`: BlueZ through `busctl`, parsing its typed text output (busctl's JSON mode can't serialize the `a{qv}` manufacturer data that phones advertise).
+- `src/l2cap.ts` and `src/l2cap-worker.ts`: the `AF_BLUETOOTH` seqpacket socket through `bun:ffi`. Reads block in a worker thread and are posted to the main thread; writes go straight to the descriptor.
+- `src/connection.ts`: one band connection, from BlueZ connect, PSM read, L2CAP open, handshake, and subscription to status queries when quiet and a clean shutdown with the disable acknowledgement.
+- `src/controller.ts`: the Mac app's model without the UI: gating, de-duplication, dial steps, the air cursor, late-data handling, and reconnect with backoff.
+- `src/air-cursor.ts`, `src/uinput.ts`, `src/keys.ts`, `src/motion.ts`: the air cursor's pointer model, its virtual mouse, Escape and Alt, and motion readings.
+- `src/daemon.ts`: the background service and its socket API. `src/actions.ts`: the KDE and command backends.
+- `ui/`: the PySide6 launcher and tray (`kinesis-ui.py`) and the Kirigami window (`ui/qml/`), including the Qt Quick 3D hand (`ui/hand/`).
+- `kernel-fix/`: the patched Bluetooth module. `packaging/`: the user unit, launcher, and autostart entry.
 
 `bun test` (in `linux/`) runs the protocol vectors, the synthetic encrypted peer, gesture routing, the
 air cursor's pointer model, the busctl parser, a socketpair loopback of the worker, the controller,
 and the daemon.
 
-## limits
+## Limits
 
-- **enrollment required for stable sessions**: an un-enrolled band drops the stream after ~30 s
-  (`0xc001` owner gate). enrollment talks to meta's servers and needs a browser sign-in.
-- the l2cap receive mtu is requested at 8 kib; kernels that reject setting it before connect keep their default, which still carries the band's frames.
-- previous/next window use kwin's walk-through shortcuts, which switch immediately when invoked over d-bus.
-- brightness uses powerdevil, so external displays without ddc support won't respond.
-- raw semg is readings and recording only (developer mode); nothing is decoded from it.
-- the air cursor can't see the pointer's real position (wayland keeps it private), so its drift
-  correction follows what it has moved itself. it has no calibration.
+- **Enrollment is required for stable sessions**: an un-enrolled band drops the stream after about
+  30 s (the `0xc001` owner gate). Enrollment talks to Meta's servers and needs a browser sign-in.
+- The L2CAP receive MTU is requested at 8 KiB; kernels that reject setting it before connect keep their default, which still carries the band's frames.
+- Previous and next window use KWin's walk-through shortcuts, which switch immediately when invoked over D-Bus.
+- Brightness uses PowerDevil, so external displays without DDC support won't respond.
+- Raw sEMG is for readings and recording only (developer mode); nothing is decoded from it.
+- The air cursor can't see the pointer's real position (Wayland keeps it private), so its drift
+  correction follows what it has moved itself. It has no calibration.
 
-## license
+## License
 
-mit, as upstream: see [LICENSE](LICENSE). the 3d hand is the webxr generic hand (mit), see
+MIT, as upstream: see [LICENSE](LICENSE). The 3D hand is the WebXR generic hand (MIT); see
 [linux/ui/hand/](linux/ui/hand/).

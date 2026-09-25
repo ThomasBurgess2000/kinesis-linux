@@ -1,3 +1,3 @@
-# kinesis for linux
+# Kinesis for Linux
 
-the linux port is documented in the repository's [README](../README.md).
+The Linux port is documented in the repository's [README](../README.md).
