@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Kinesis
+GenericName=Neural Band Controls
+Comment=Control your desktop with the Meta Neural Band
+Exec=/usr/bin/env python3 @REPO@/ui/kinesis-ui.py
+Icon=@REPO@/ui/icons/kinesis.svg
+Categories=Settings;HardwareSettings;
+Keywords=band;gesture;neural;meta;emg;
+StartupNotify=false

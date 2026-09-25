@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Kinesis
+Comment=Meta Neural Band controls in the system tray
+Exec=/usr/bin/env python3 @REPO@/ui/kinesis-ui.py --tray-only
+Icon=@REPO@/ui/icons/kinesis.svg
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

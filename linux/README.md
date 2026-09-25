@@ -2,7 +2,7 @@
 
 use your meta neural band to control a linux desktop. same protocol and gesture rules as the mac app, running on bun with bluez.
 
-- **transport**: bluez over d-bus (`busctl`) for discovery, the psm characteristic, pairing, and battery; a raw le l2cap socket for the encrypted input stream. no root, no kernel patches.
+- **transport**: bluez over d-bus (`busctl`) for discovery, the psm characteristic, pairing, and battery; a raw le l2cap socket for the encrypted input stream. no root. linux kernels before 7.2 need one bluetooth patch for sessions longer than ~40 s (see [kernel](#kernel)).
 - **crypto**: the airshield handshake and packet authentication are a direct port of `Sources/KinesisCore`, checked against the same test vectors and synthetic-peer tests.
 - **actions**: on kde plasma, global shortcuts are invoked over d-bus, which works on wayland without input injection. escape and tab switching go through `ydotool`. any action can be replaced with your own command, so other desktops work too.
 
@@ -12,6 +12,41 @@ use your meta neural band to control a linux desktop. same protocol and gesture 
 - bun 1.2+
 - for the built-in kde backend: plasma 6 with `qdbus6` (package `qt6-tools` or `qdbus-qt6`); optionally `ydotool` with `ydotoold` running for the escape and tab actions
 - for other desktops: `xdotool`, `ydotool`, `wtype`, or any command you want to map
+- for the app (tray icon + window): pyside6 with its qml modules, and kirigami + kirigami addons (installed with plasma):
+  `sudo apt install python3-pyside6.qtqml python3-pyside6.qtquick python3-pyside6.qtnetwork`
+
+## the app
+
+a tray icon and a kirigami window, like the mac app's menu bar and main window. the band lives in a
+background service (`kinesis daemon`, the `kinesis.service` user unit); the window only draws it, so
+closing or restarting the window never drops the band.
+
+```sh
+cd linux
+bun install
+packaging/install.sh              # user unit + launcher + login autostart, then opens kinesis
+packaging/install.sh --uninstall  # removes them again (pairing and settings are kept)
+```
+
+first launch runs a quick setup: pair the band (sign in with meta once, claim the band), pick your
+wrist, try a swipe, try pinch + turn on a practice dial, then a summary with a test action. after
+that the window has:
+
+- **band column**: status, battery, gesture count, and the one next step (pair, connect, enable or pause controls)
+- **overview**: the last gesture and what it did, live, and your assignments
+- **gestures**: an action for each swipe and tap, and the pinch dial's target and sensitivity. changes apply immediately
+- **band**: wrist, start automatically, start at login, meta account, diagnostics with a test action, and forget this band
+
+the tray menu has the status, battery, the next step, disconnect, open, and quit. quitting stops the
+service too. the command line still works for scripting; `run`, `hand` and `enroll` refuse while the
+service holds the band (`systemctl --user stop kinesis.service` first).
+
+`python3 ui/kinesis-ui.py --check [--screenshots DIR]` renders every page and setup step offscreen
+against canned data and fails on any qml warning (no band or service needed).
+
+the service speaks newline-delimited json on `$XDG_RUNTIME_DIR/kinesis/daemon.sock` (0600): requests
+`{id, method, params}`, replies `{id, result|error}`, and pushed `{event, data}` for state, config,
+gesture, action, dial, pairing, and log. see `src/daemon.ts`.
 
 ## run it
 
@@ -28,11 +63,11 @@ bun run src/cli.ts run         # connects, enables controls, and reconnects if t
 
 ## enrollment
 
-the band gates its sensor stream to whichever key it was enrolled with. without that key a fresh
-session is dropped after ~30 s (`0xc001`). `kinesis enroll` claims the band to your meta account and
-stores a signing key locally, so every later `run` proves ownership with a per-session trust
-handshake and streams indefinitely — the same thing the phone app does. you sign in on meta's own
-page in your browser and paste back the `fb-viewapp://frl_login…` url the sign-in ends on; this
+the band gates its sensor stream to whichever key it was enrolled with (`0xc001` without it).
+`kinesis enroll` (or pairing in the app) claims the band to your meta account and stores a signing
+key locally, so every later session proves ownership with a per-session trust handshake — the same
+thing the phone app does. you sign in on meta's own page in your browser; a temporary handler for the
+`oculus://` / `fb-viewapp://` callback captures the result (the cli falls back to pasting it). this
 client never sees your password, only the returned blob. the key lives in
 `~/.local/state/kinesis/identity/` and the meta session in `~/.local/state/kinesis/meta-session.json`.
 run it once with the band in pairing mode; after that just `kinesis run`.
@@ -106,6 +141,25 @@ the tested firmware accepts a fresh encrypted session without a bluetooth bond, 
 - `src/actions.ts` — kde and command backends.
 
 `bun test` runs the protocol vectors, the synthetic encrypted peer, gesture routing, the busctl parser, a socketpair loopback of the worker, and the controller.
+
+## kernel
+
+linux kernels before 7.2 leak an l2cap signaling ident on every le credit packet. after 254 credit
+packets they're sent with the invalid ident 0, the band ignores them, and the stream stops — about
+37 s into a full-rate session, sooner with a smaller socket buffer. `dmesg` shows `Bluetooth: Unable to
+allocate ident: -28`. it's fixed upstream in
+[6e1930ece855](https://github.com/torvalds/linux/commit/6e1930ece855); until your distribution ships
+it, `kernel-fix/` builds a patched `bluetooth.ko` for your running kernel and swaps it in without a
+reboot:
+
+```sh
+kernel-fix/build.sh                    # no root: fetches your kernel's source, patches, builds, verifies
+sudo kernel-fix/install.sh             # installs to /lib/modules/<release>/updates and reloads bluetooth
+sudo kernel-fix/uninstall.sh           # back to the stock module
+```
+
+re-run both after a kernel update. `kinesis doctor` (and diagnostics in the app) report whether the
+patched module is loaded.
 
 ## limits
 
