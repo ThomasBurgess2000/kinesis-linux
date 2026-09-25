@@ -556,16 +556,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.check:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        # The offscreen platform defaults to the software renderer, which can't draw the 3D hand.
+        # The offscreen platform defaults to the software renderer and an OpenGL 2.0 context,
+        # neither of which can draw the 3D hand. (A desktop session's own defaults can; forcing
+        # this format there fails on Wayland's EGL and drops Qt to software rendering.)
         os.environ.setdefault("QT_QUICK_BACKEND", "rhi")
-    # The overview hand is Qt Quick 3D, which wants OpenGL 3.3 core rather than whatever the
-    # platform offers first (the offscreen platform's is 2.0).
-    surface = QSurfaceFormat()
-    surface.setVersion(3, 3)
-    surface.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
-    surface.setDepthBufferSize(24)
-    surface.setStencilBufferSize(8)
-    QSurfaceFormat.setDefaultFormat(surface)
+        surface = QSurfaceFormat()
+        surface.setVersion(3, 3)
+        surface.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+        surface.setDepthBufferSize(24)
+        surface.setStencilBufferSize(8)
+        QSurfaceFormat.setDefaultFormat(surface)
     # Plasma's platform theme picks these anyway; being explicit keeps the window native elsewhere
     # (and makes --check render what you'd actually see).
     os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop")
