@@ -120,6 +120,8 @@ export class BandSession {
   hand: BandHand | undefined;
 
   onFrame: ((frame: { channel: number; words: number[]; length: number }) => void) | undefined;
+  /// Diagnostics: transport records outside the authenticated stream (control/relay markers).
+  onTransport: ((record: Uint8Array) => void) | undefined;
 
   constructor(options: SessionOptions = {}) {
     this.ecdh.generateKeys();
@@ -194,6 +196,7 @@ export class BandSession {
           this.receiver = new AirShieldReceiver(new AirShieldCipher(
             AirShieldKeys.derive(secret, this.challenge, peerSeed, airShieldParams(this.negotiatedParams)),
             peerIV, Number(peerBase), macPrefixFor(this.negotiatedParams)));
+          this.receiver.onSkipped = (record) => this.onTransport?.(record);
           if (this.ceremony) {
             // Enrollment startup runs the ownership ceremony instead of the identity queries.
             this.setupStage = "ceremony";

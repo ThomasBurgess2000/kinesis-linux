@@ -9,7 +9,7 @@ import type { CeremonyPairData, CeremonyPairRequestData } from "./ceremony";
 import type { BandDevice, BandEvent, BandHand } from "./gestures";
 import { L2capChannel, type SecurityLevel } from "./l2cap";
 import { BandSession, type SessionOptions } from "./session";
-import { concat } from "./wire";
+import { concat, hex } from "./wire";
 
 export class KinesisError extends Error {
   constructor(message: string) {
@@ -246,6 +246,7 @@ export class BandConnection {
       this.log.info("L2CAP channel opened");
       this.session = new BandSession(session);
       this.session.onFrame = (frame) => this.log.info(`  frame ch=0x${frame.channel.toString(16)} words=[${frame.words.map((w) => "0x" + w.toString(16)).join(",")}] len=${frame.length}`);
+      this.session.onTransport = (record) => this.log.info(`  transport record ${hex(record.subarray(0, 24))}${record.length > 24 ? `… (${record.length} B)` : ""}`);
       this.channel?.write(this.session.request());
     } catch (error) {
       this.fail(error);

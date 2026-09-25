@@ -106,6 +106,9 @@ export class AirShieldCipher {
 
 export class AirShieldReceiver {
   private pending: Uint8Array = new Uint8Array();
+  /// Diagnostics: every record the receiver passes over unauthenticated (0x81/0x82 control,
+  /// 0x01/0x02 relay, 0x41/0x42 relay-encrypted).
+  onSkipped?: (record: Uint8Array) => void;
 
   constructor(readonly cipher: AirShieldCipher) {}
 
@@ -115,6 +118,7 @@ export class AirShieldReceiver {
     while (this.pending.length > 0) {
       const marker = this.pending[0]!;
       if ((marker === 0x81 || marker === 0x82) && this.pending.length >= 2 && this.pending[1]! <= 1) {
+        this.onSkipped?.(this.pending.slice(0, 2));
         this.pending = this.pending.slice(2);
         continue;
       }
@@ -122,6 +126,7 @@ export class AirShieldReceiver {
         if (this.pending.length < 2) break;
         const size = 3 + this.pending[1]!;
         if (this.pending.length < size) break;
+        this.onSkipped?.(this.pending.slice(0, size));
         this.pending = this.pending.slice(size);
         continue;
       }
@@ -133,6 +138,7 @@ export class AirShieldReceiver {
       const size = 10 + (this.pending[9]! + 1) * 16;
       if (this.pending.length < size) break;
       if (marker === 0x40) plaintext.push(this.cipher.decrypt(this.pending.slice(0, size)));
+      else this.onSkipped?.(this.pending.slice(0, size));
       // Relay channels are not part of the authenticated input service.
       this.pending = this.pending.slice(size);
     }
