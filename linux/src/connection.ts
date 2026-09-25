@@ -192,7 +192,7 @@ export class BandConnection {
   private async connect(band: BandDevice, options: { security: SecurityLevel; session?: SessionOptions; bond?: boolean; directL2cap?: boolean; psm?: number }): Promise<void> {
     const security = options.security;
     const session = options.session ?? {};
-    const directL2cap = options.directL2cap ?? true;
+    const directL2cap = options.directL2cap ?? false;
     this.emit({ payload: { type: "preparing" }, receivedAt: now() });
     await bluez.stopDiscovery().catch(() => {});
     // If the band is already connected, use that link; otherwise scan until it advertises.

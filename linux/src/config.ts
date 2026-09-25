@@ -67,7 +67,8 @@ export const DEFAULT_CONFIG: Config = {
   linkSetup: "pipelined",
   configChannel: 0x8006,
   bond: false, // not needed: the ~37 s stalls were the kernel credit-ident bug (see kernel-fix/)
-  directL2cap: true,
+  // BlueZ's managed connect: without a bond the band refuses a direct L2CAP channel.
+  directL2cap: false,
   psm: 255,
   setupDone: false,
   startAutomatically: true,
