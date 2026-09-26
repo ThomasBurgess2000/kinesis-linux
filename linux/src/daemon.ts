@@ -25,6 +25,7 @@ import {
 import { BandIdentity } from "./identity";
 import { MetaSessionStore } from "./meta-auth";
 import { MetaSessionInvalidError } from "./meta-pair";
+import { BandRecords, describe } from "./band-records";
 import { MotionLog, MotionReadings } from "./motion";
 import { EMGReadings, RawRecorder, type ReadingsStats } from "./readings";
 import { watchSleep } from "./sleep";
@@ -143,6 +144,7 @@ export class Daemon {
   private motionLog!: MotionLog;
   /// Per client (or "local" for in-process calls): which motion views are open.
   private readonly viewing = new Map<unknown, Viewing>();
+  private readonly records = new BandRecords((_, text) => this.log.notice(`The band sent something new:\n${text}`));
 
   constructor(private readonly options: DaemonOptions = {}) {
     this.path = options.socketPath ?? socketPath();
@@ -179,12 +181,16 @@ export class Daemon {
       onHandConfirmed: (hand) => void this.handConfirmed(hand),
       onBandResolved: (device) => void this.bandResolved(device),
       onMotion: (sample) => this.motion.receive(sample),
-      onBandEvent: (event) => this.motionLog.record(event),
+      onBandEvent: (event) => {
+        this.motionLog.record(event);
+        if (event.payload.type === "inspection") this.records.receive(event.payload.channel, event.payload.kind, event.payload.payload);
+      },
     }, this.options.clock, this.options.cursor);
     this.motionLog = this.options.motionLog ?? new MotionLog();
     if (this.motionLog.isOn) this.updateViewers();
     await this.refreshAccount();
     await this.loadStats();
+    await this.records.load();
     // Live EMG is a developer-mode feature; its last setting comes back with it.
     this.controller.setRawEMG(this.config.developerMode && this.config.rawEMG);
     this.emgTimer = setInterval(() => this.pushReadings(), 50);
@@ -363,6 +369,7 @@ export class Daemon {
         return this.state();
       }
       case "setViewing": this.setViewing(client, params.page, params.visible); return this.state();
+      case "bandRecords": return this.records.list().map((record) => ({ ...record, text: describe(record) }));
       default: throw new DaemonError(`Unknown method "${method}"`);
     }
   }

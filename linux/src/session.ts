@@ -674,7 +674,19 @@ export class BandSession {
     return [event({ type: "dialState", engaged: this.dial.engaged }, time)];
   }
 
+  /// Every frame after link setup that isn't sensor data is also reported as an inspection event,
+  /// so the protocol's other messages can be read. The trust and ceremony exchanges before it carry
+  /// certificates and signatures and are left out.
   private input(frame: DataXFrame, time: number, outgoing: Uint8Array[]): BandEvent[] {
+    const kind = frame.words[frame.words.length - 1] ?? this.channelTypes.get(frame.channel);
+    const inspected = (this.setupStage === "deviceInfo" || this.setupStage === "input") && kind !== undefined
+      && ![0x0200020a, 0x0200020d, 0x0200020f, 0x02000212].includes(kind);
+    const events = this.handleFrame(frame, time, outgoing);
+    if (!inspected || kind === undefined) return events;
+    return [event({ type: "inspection", channel: frame.channel, kind, payload: frame.payload }, time), ...events];
+  }
+
+  private handleFrame(frame: DataXFrame, time: number, outgoing: Uint8Array[]): BandEvent[] {
     const last = frame.words[frame.words.length - 1];
     if (last !== undefined) {
       if (this.channelTypes.size >= 1024 && !this.channelTypes.has(frame.channel)) {

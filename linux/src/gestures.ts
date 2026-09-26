@@ -38,6 +38,9 @@ export type BandEventPayload =
   | { type: "gyro"; timestampUs: bigint; values: [number, number, number] }
   /// One orientation sample: a unit quaternion in wire order w, x, y, z.
   | { type: "orientation"; timestampUs: bigint; values: [number, number, number, number] }
+  /// A reply or message from the band other than sensor data, for looking inside the protocol:
+  /// device info, configuration, stream state, battery, and anything not otherwise understood.
+  | { type: "inspection"; channel: number; kind: number; payload: Uint8Array }
   /// The band confirmed (or refused, or never answered) a change of motion streams.
   | { type: "motionStreams"; streams: MotionStreams; confirmedAfter: number; accepted: boolean }
   /// The band acknowledged the sensor subscription (data may still be on its way).

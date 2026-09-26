@@ -76,6 +76,14 @@ bun run src/cli.ts enroll      # claims the band to your Meta account (once)
 bun run src/cli.ts run         # connects, enables controls, and reconnects if the link drops
 ```
 
+`kinesis inspect` prints everything distinct the band has sent besides sensor data, decoded field
+by field: its device info, configuration, stream state, battery, and any message the port doesn't
+otherwise understand. The service records these as they arrive (only from requests it already
+makes; nothing extra is sent to the band) in `~/.local/state/kinesis/band-records.json`. Field names
+come from what [neural-band-poc](https://github.com/callbacked/neural-band-poc) recovered from the
+phone app; unnamed fields show by number. This is how undocumented settings, such as a haptics
+switch, might be found.
+
 `run --practice` connects and prints gestures without sending anything to the desktop. `run --verbose`
 logs the Bluetooth steps. Ctrl-C disables the band's streams cleanly before exiting. To install it as
 a command, run `bun link` in `linux/`, then `kinesis run`.

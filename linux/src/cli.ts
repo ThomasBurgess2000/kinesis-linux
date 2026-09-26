@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
-// kinesis for Linux: scan, pair, run, hand, config, actions, doctor, forget.
+// kinesis for Linux: scan, pair, run, hand, config, actions, doctor, inspect, forget.
 
 import { parseArgs } from "node:util";
 import { ALL_ACTIONS, LoggingBackend, backendFor } from "./actions";
 import * as bluez from "./bluez";
 import { type Config, ConfigError, DEFAULT_CONFIG, applyConfigPatch, configPath, loadConfig, saveConfig, settingPatch } from "./config";
 import { BandConnection, KinesisError, type Logger } from "./connection";
+import { BandRecords, describe as describeRecord, recordsPath } from "./band-records";
 import { Controller } from "./controller";
 import { Daemon, DaemonError, daemonRunning } from "./daemon";
 import { describeDevice as describe, doctorRows } from "./doctor";
@@ -29,6 +30,7 @@ usage:
   kinesis config [get KEY | set KEY VALUE | path] show or change settings
   kinesis actions [--test ACTION]                 list actions and their support; test one
   kinesis doctor                                  check Bluetooth, tools, and permissions
+  kinesis inspect [--json]                        what the band has sent besides sensor data, decoded
   kinesis forget                                  drop the saved band and remove it from BlueZ
 
 config keys: swipes.left|right|up|down  taps.indexTap|indexDoubleTap|middleTap|middleDoubleTap|middleHold
@@ -303,6 +305,28 @@ async function daemon(): Promise<void> {
   await new Promise(() => {});
 }
 
+/// Everything distinct the band has sent besides sensor data (device info, configuration, stream
+/// state, battery, anything not otherwise understood), as the service saved it.
+async function inspect(args: string[]): Promise<void> {
+  const { values } = parseArgs({ args, options: { json: { type: "boolean" } } });
+  const records = new BandRecords(() => {});
+  await records.load();
+  const list = records.list();
+  if (list.length === 0) {
+    console.log(`Nothing recorded yet. The service records what the band sends when it connects (${recordsPath()}).`);
+    return;
+  }
+  if (values.json) {
+    console.log(JSON.stringify(list, null, 2));
+    return;
+  }
+  for (const record of list) {
+    console.log(`${describeRecord(record)}
+  first seen ${record.firstSeen}
+`);
+  }
+}
+
 async function forget(): Promise<void> {
   const config = await loadConfig();
   const band = config.band;
@@ -329,6 +353,7 @@ async function main(): Promise<void> {
       case "config": return await configCommand(args);
       case "actions": return await actions(args);
       case "doctor": return await doctor();
+      case "inspect": return await inspect(args);
       case "forget": return await forget();
       case undefined:
       case "help":
