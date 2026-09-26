@@ -82,7 +82,8 @@ otherwise understand. The service records these as they arrive (only from reques
 makes; nothing extra is sent to the band) in `~/.local/state/kinesis/band-records.json`. Field names
 come from what [neural-band-poc](https://github.com/callbacked/neural-band-poc) recovered from the
 phone app; unnamed fields show by number. This is how undocumented settings, such as a haptics
-switch, might be found.
+switch, might be found. What one band reported so far, and what's still unidentified, is in
+[linux/docs/band-records.md](linux/docs/band-records.md).
 
 `run --practice` connects and prints gestures without sending anything to the desktop. `run --verbose`
 logs the Bluetooth steps. Ctrl-C disables the band's streams cleanly before exiting. To install it as
