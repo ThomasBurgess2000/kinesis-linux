@@ -2,6 +2,8 @@
 // messages where the bytes parse as one, text where they read as text, hex otherwise. Field names
 // come from what neural-band-poc recovered from the phone app's name maps (see its docs/
 // handedness.md, findings.md and gesture-models.md); anything unnamed is still shown by number.
+// Names ending in "?" are this port's inferences from the values a band reported, not names from
+// the app: see linux/docs/band-records.md.
 
 export type ProtoNode =
   | { field: number; name?: string; wire: "varint"; value: string }
@@ -16,17 +18,31 @@ interface Schema {
 const SCHEMAS: Record<string, Schema> = {
   RpcRequest: { 1: { name: "requestId" }, 3: { name: "deviceInfoReq" }, 4: { name: "streamControlReq", message: "StreamControl" }, 5: { name: "configReq", message: "Config" } },
   RpcResponse: {
-    1: { name: "requestId" }, 2: { name: "status" }, 3: { name: "response" }, 5: { name: "streamControlResp", message: "StreamControl" },
+    1: { name: "requestId" }, 2: { name: "status" }, 3: { name: "batteryResp", message: "BatteryResp" },
+    4: { name: "deviceInfoResp", message: "DeviceInfo" }, 5: { name: "streamControlResp", message: "StreamControl" },
     6: { name: "configResp", message: "Config" },
+  },
+  BatteryResp: { 1: { name: "batteryData", message: "Battery" } },
+  Battery: {
+    1: { name: "level" }, 2: { name: "charging" }, 3: { name: "temperatureC?" }, 4: { name: "millivolts?" }, 5: { name: "milliamps?" },
+    6: { name: "uptimeSeconds?" },
   },
   StreamControl: {
     2: { name: "enableRawEmg" }, 3: { name: "enableGestures" }, 4: { name: "enableRawInference" }, 6: { name: "enableGyro" },
     8: { name: "enableQuat" },
   },
-  Config: { 10: { name: "isLeftHanded" }, 42: { name: "emgConfig", message: "EmgConfig" }, 46: { name: "inferenceConfig", message: "InferenceConfig" } },
+  Config: {
+    10: { name: "isLeftHanded" }, 40: { name: "accelerometer?", message: "ImuConfig" }, 41: { name: "gyroscope?", message: "ImuConfig" },
+    42: { name: "emgConfig", message: "EmgConfig" }, 46: { name: "inferenceConfig", message: "InferenceConfig" },
+  },
+  ImuConfig: { 2: { name: "rateHz?" }, 4: { name: "unitsPerCount?" }, 5: { name: "range?" }, 8: { name: "calibration?" } },
   EmgConfig: { 1: { name: "samplingFrequency" }, 2: { name: "channels" }, 4: { name: "adcBits" }, 5: { name: "samplesPerBatch" }, 10: { name: "encoding" } },
   InferenceConfig: { 1: { name: "downsampleWindow" }, 2: { name: "modelStride" }, 3: { name: "pipelineType" }, 4: { name: "normalized" }, 5: { name: "numLogits" } },
-  DeviceInfo: { 9: { name: "modelId" }, 10: { name: "allModelIds" } },
+  DeviceInfo: {
+    1: { name: "manufacturer?" }, 2: { name: "firmwareRevision?" }, 3: { name: "firmwareBuild?" }, 4: { name: "hardwareStage?" },
+    5: { name: "gestureModel?" }, 6: { name: "serialNumber?" }, 7: { name: "emgRateHz?" }, 8: { name: "imuRateHz?" }, 9: { name: "modelId" },
+    10: { name: "allModelIds" },
+  },
 };
 
 /// Decodes `data` as a protobuf message, or undefined when it isn't one.

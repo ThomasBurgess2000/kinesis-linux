@@ -41,4 +41,8 @@ test("records keep each distinct message once, whatever its request ID", () => {
   records.receive(0x8008, 0x02000315, reply(3, 75));
   expect(seen).toEqual(["battery reply", "battery reply"]);
   expect(records.list().map((r) => r.count)).toEqual([2, 1]);
+  // A message that changes every time is logged a few times, and only its latest versions are kept.
+  for (let level = 74; level > 60; level--) records.receive(0x8008, 0x02000315, reply(10, level));
+  expect(seen).toHaveLength(3);
+  expect(records.list()).toHaveLength(5);
 });

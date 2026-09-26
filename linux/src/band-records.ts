@@ -43,9 +43,15 @@ export function recordName(channel: number, kind: number): string {
 
 /// Distinct messages kept; the least recently seen go first.
 const MAXIMUM_RECORDS = 200;
+/// Some messages change every time (battery readings carry temperature, current and a clock), so
+/// only the first few versions of each kind are logged, and only the latest few are kept.
+const LOGGED_PER_KIND = 3;
+const KEPT_PER_KIND = 5;
 
 export class BandRecords {
   private readonly records = new Map<string, BandRecord>();
+  /// Distinct versions seen this session, per channel and message type.
+  private readonly versions = new Map<string, number>();
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(private readonly onChange: (record: BandRecord, text: string) => void, private readonly path = recordsPath()) {}
@@ -80,12 +86,15 @@ export class BandRecords {
       return;
     }
     const record: BandRecord = { name: recordName(channel, kind), channel, kind, firstSeen: now, lastSeen: now, count: 1, hex, decoded };
+    const kindKey = `${channel & 0xff}:${kind}`;
+    const versions = (this.versions.get(kindKey) ?? 0) + 1;
+    this.versions.set(kindKey, versions);
     this.records.set(id, record);
-    if (this.records.size > MAXIMUM_RECORDS) {
-      const oldest = [...this.records].sort((a, b) => a[1].lastSeen.localeCompare(b[1].lastSeen))[0];
-      if (oldest) this.records.delete(oldest[0]);
-    }
-    this.onChange(record, describe(record));
+    const sameKind = [...this.records].filter(([k]) => k.startsWith(`${kindKey}:`));
+    const evict = sameKind.length > KEPT_PER_KIND ? sameKind : this.records.size > MAXIMUM_RECORDS ? [...this.records] : [];
+    const oldest = evict.sort((a, b) => a[1].lastSeen.localeCompare(b[1].lastSeen))[0];
+    if (oldest) this.records.delete(oldest[0]);
+    if (versions <= LOGGED_PER_KIND) this.onChange(record, describe(record));
     this.scheduleSave();
   }
 
@@ -113,6 +122,8 @@ function key(channel: number, kind: number, content: string): string {
 /// A record as readable text: what it is, then its fields.
 export function describe(record: BandRecord): string {
   const header = `${record.name} (channel 0x${record.channel.toString(16)}, type 0x${record.kind.toString(16).padStart(8, "0")}, ${record.hex.length / 2} bytes)`;
-  const body = record.decoded ? formatProto(record.decoded, "  ") : `  not protobuf: 0x${record.hex}`;
+  // Decoded again from the bytes, so names learned since it was saved apply.
+  const decoded = decodeProto(Buffer.from(record.hex, "hex"), record.kind === 0x02000315 ? "RpcResponse" : undefined);
+  const body = decoded ? formatProto(decoded, "  ") : `  not protobuf: 0x${record.hex}`;
   return `${header}\n${body}`;
 }
